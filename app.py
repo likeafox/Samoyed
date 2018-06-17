@@ -3,6 +3,7 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import Column, Integer, String, Boolean, Sequence,\
                        ForeignKey, PrimaryKeyConstraint
 from sqlalchemy.orm import relationship
+from sqlalchemy.orm.exc import *
 
 import json, uuid, os, os.path, tempfile
 
@@ -86,9 +87,16 @@ class FileAccess(db.Model):
 
 
 
-# Request data validation
-class InvalidRequestError(Exception): pass
+#exceptions
+class RequestException(Exception): code = 400
+class InvalidRequest(RequestException): code = 400
+class NoResult(RequestException): code = 404
+class LimitReached(RequestException): code = 403
+class Denied(RequestException): code = 403
 
+
+
+# Request data validation
 @call
 def req_validators():
     import base64, re
@@ -129,6 +137,8 @@ def req_validators():
         'can_modify': [type_validate, bool],
         'enc_file_key': [b64_validate, FileAccess.enc_file_key],
         'hidden_fn': [b64_validate, FileAccess.hidden_fn],
+        'nonce': [b64_validate, File.nonce],
+        'enc_file_meta': [b64_validate, File.enc_meta],
     }
 
 def validate_request_params(obj):
@@ -136,9 +146,9 @@ def validate_request_params(obj):
         try:
             [f, *xargs] = req_validators[k]
         except KeyError:
-            raise InvalidRequestError("Parameter does not exist.")
+            raise InvalidRequest("Parameter does not exist.")
         if not f(v,*xargs):
-            raise InvalidRequestError("Invalid value for "+k+".")
+            raise InvalidRequest("Invalid value for "+k+".")
 
 
 
@@ -153,29 +163,26 @@ def req_handlers():
             r[f.__name__] = (reqtype, f, auth, args)
         return d
 
-    @handler('GET', auth=False)
-    def ERASE_EVERYTHING():
-        '''for testing purposes only'''
-        print("nope")
-        print('https://stackoverflow.com/questions/4763472/sqlalchemy-clear-database-content-but-dont-drop-the-schema')
-        return 0
-
     @handler("GET", auth=False)
     def GET_REPO_INFO():
         return dict(((k, Config()[k]) for k in public_config_opts))
 
     @handler("GET", auth=False)
     def GET_USER(key_hash):
-        #todo check how many users there are first
-        user = User.query.filter_by(key_hash=key_hash).one()
-        return jsonize(user, "id name")
+        try:
+            user = User.query.filter_by(key_hash=key_hash).one()
+        except NoResultFound:
+            raise NoResult("That user does not exist.")
+        return json.loads(jsonize(user, "id name"))
 
     @handler("GET", auth=False)
     def GET_USER_NAMES():
-        return list(db.session.query(User.name).all())
+        return [x for (x,) in db.session.query(User.name).all()]
 
     @handler("POST", auth=False)
     def NEW_USER(name, key_hash):
+        if User.query.count() >= Config()['max_users']:
+            raise Exception("fuck off")
         #http://docs.sqlalchemy.org/en/latest/errors.html#integrityerror
         user = User(name=name, key_hash=key_hash)
         db.session.add(user)
@@ -190,8 +197,9 @@ def req_handlers():
 
     @handler("GET")
     def GET_UNACCEPTED_FILE_LIST(user_id):
-        return db.session.query(FileAccess.file_id).filter_by(
-            user_id=user_id, accepted=False).all()
+        q = db.session.query(FileAccess.file_id).filter_by(
+                user_id=user_id, accepted=False)
+        return [x for (x,) in q.all()]
 
     @handler("GET")
     def GET_FILE_META(user_id, file_id):
@@ -203,7 +211,7 @@ def req_handlers():
         start, end = start_end
         if start is None: start = 0
         fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-        fn = fa.file.uuid_fn
+        fn = fa.file.uuid_name
         import os.path
         with open(os.path.join("files",fn), 'rb') as fh:
             fh.seek(start)
@@ -212,19 +220,19 @@ def req_handlers():
             else:
                 d = fh.read(end-start)
         import base64
-        return base64.b64encode(d)
+        return base64.b64encode(d).decode()
 
     @handler("GET")
     def GET_FILE_USERS(user_id, file_id):
         q=db.session.query(User.name).filter(User.id==FileAccess.user_id)\
                                      .filter(FileAccess.file_id==file_id)
-        r = list(q.all())
+        r = [x for (x,) in q.all()]
         return r
 
     @handler("POST")
     def NEW_FILE_ACCESS(user_id, file_id, target_username, can_modify):
         fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-        target_user_id = User.id.query(name=target_username).one()
+        target_user_id = User.query.filter_by(name=target_username).value(User.id)
         if fa.can_modify == False and can_modify == True:
             raise Exception("you can't do that")
         new_fa = FileAccess(file_id=file_id, user_id=target_user_id,
@@ -253,7 +261,10 @@ def req_handlers():
                 raise Exception("file's to big man")
             kb_size = ((file_size - 1) // 1024) + 1
             from sqlalchemy.sql import func
-            db_kb_size = db.session.query(func.sum(File.kb_size)).all()
+            x = db.session.query(func.sum(File.kb_size)).all()[0][0]
+            db_kb_size = x or 0
+            print(db_kb_size)
+            #db.session.query(func.sum(File.kb_size)).all()
             if db_kb_size+kb_size > Config()['max_kb']:
                 raise Exception("Repo is full")
             file = File(uuid_name=uuid_fn, nonce=nonce,
@@ -268,6 +279,7 @@ def req_handlers():
         except:
             os.remove(f_path)
             raise
+        return file.id
 
     @handler("POST")
     def UPDATE_FILE(user_id, file_id, nonce, enc_file_meta):
@@ -298,56 +310,63 @@ def req_handlers():
 
     @handler("POST")
     def UNLINK_FILE(user_id, file_id):
-        q = FileAccess.query.filter_by(file_id=file_id)
-        fa = q.filter_by(user_id=user_id).one()
-        if q.count() == 1:
-            file = File.query(file_id=file_id).one()
-            os.remove(os.path.join("files",file.uuid_fn))
-            file.query.delete()
-        fa.query.delete()
+        fa_q = FileAccess.query.filter_by(file_id=file_id,user_id=user_id)
+        fa = fa_q.one()
+        file = fa.file
+        if len(file.file_accessors) == 1:
+            os.remove(os.path.join(save_path,file.uuid_name))
+            File.query.filter_by(id=file_id).delete()
+        fa_q.delete()
         db.session.commit()
 
     @handler("GET", auth=False)
     def HELP():
-        return list(req_handlers.keys())
+        return [[k,v[0]] for k,v in req_handlers.items()]
 
     return r
 
 @app.route("/", methods=['GET', 'POST'])
 def handle_request():
-    def error(msg, code=400): return json.dumps({'error':msg, 'response':"ERR"}), code
-    global_permissions = { Config()['get_access_key']:('GET',),
-                           Config()['post_access_key']:('GET','POST'),
-                           }.get(request.form['access_key'],())
-    if request.method not in global_permissions:
-        return error("Unauthorized",403)
     try:
+        if set(request.form) != {'access_key','req_type','params'}:
+            raise InvalidRequest("Malformed request.")
+        global_permissions = { Config()['get_access_key']:('GET',),
+                               Config()['post_access_key']:('GET','POST'),
+                               }.get(request.form['access_key'],())
+        if request.method not in global_permissions:
+            raise Denied("Unauthorized.")
+        if request.form['req_type'] not in req_handlers:
+            raise InvalidRequest("Unknown request.")
         reqtypemethod, handler, require_auth, arg_names = req_handlers[request.form['req_type']]
-    except KeyError:
-        return error("Unknown Request Type")
-    if request.method != reqtypemethod:
-        return error("Wrong Request Method (GET/POST?)")
-    try:
-        params = json.loads(request.form["params"])
+        if request.method != reqtypemethod:
+            raise InvalidRequest("Incompatable request method.")
+
+        try:
+            params = json.loads(request.form["params"])
+        except json.JSONDecodeError:
+            raise InvalidRequest("Malformed request.")
         validate_request_params(params)
-    except KeyError:
-        return error("No Params")
-    except json.JSONDecodeError:
-        return error("JSON not work")
-    except InvalidRequestError as e:
-        return error(e.args.__repr__())
-    if require_auth:
-        cred = { 'id':params['user_id'], 'key_hash':params['key_hash'] }
-        if User.query.filter_by(**cred).count() == 0:
-            return error("Unauthorized2",403)
-    if not set(arg_names) <= params.keys():
-        return error("missing parameters")
-    args = (params[p] for p in arg_names)
-    try:
-        return json.dumps({'result':handler(*args), 'response':"OK", 'error':""})
+
+        if require_auth:
+            try:
+                cred = { 'id':params['user_id'], 'key_hash':params['key_hash'] }
+                User.query.filter_by(**cred).one()
+            except (KeyError, NoResultFound):
+                raise Denied("Invalid credentials.")
+
+        if not set(arg_names) <= params.keys():
+            raise InvalidRequest("Request is missing parameters")
+        args = (params[p] for p in arg_names)
+        return json.dumps({'result':handler(*args), 'response':"OK"})
+
     except Exception as e:
-        print(type(e), e)
-        return error(e.args.__repr__())
+        ro = {'response':"ERR",
+              'error': e.args.__repr__(),
+              'error_class': e.__class__.__name__}
+        if not isinstance(e, RequestException):
+            import traceback
+            traceback.print_exc()
+        return json.dumps(ro), getattr(e, 'code', 500)
 
 
 
@@ -378,3 +397,13 @@ if __name__ == '__main__':
             app.run(debug=True)
         elif cmd == "SETUP":
             setup()
+        elif cmd == "CLEANTEST":
+            if os.path.exists(save_path):
+                import shutil
+                shutil.rmtree(save_path)
+            if os.path.exists(db_path):
+                os.remove(db_path)
+            os.mkdir("files")
+            db.create_all()
+            print("recreated all the thigns")
+            app.run(debug=True)
