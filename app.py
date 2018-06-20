@@ -58,6 +58,7 @@ class File(db.Model):
     nonce = Column(String(24), nullable=False)
     enc_meta = Column(String(64), nullable=False)
     kb_size = Column(Integer, nullable=False)
+    rev = Column(Integer, nullable=False)
     file_accessors = relationship("FileAccess", back_populates="file")
     def __repr__(self):
         return "<File {}>".format(self.id)
@@ -84,6 +85,19 @@ class FileAccess(db.Model):
     user = relationship("User", back_populates="file_accessors")
     def __repr__(self):
         return "<FileAccess ({}, {})>".format(self.file_id, self.user_id)
+
+class Seq(db.Model):
+    __tablename__ = "sequences"
+    id = Column(Integer, primary_key=True)
+    v = Column(Integer)
+
+REVISION_SEQ_ID = 1
+
+def create_db():
+    db.create_all()
+    seq = Seq(id=REVISION_SEQ_ID, v=0)
+    db.session.add(seq)
+    db.session.commit()
 
 
 
@@ -267,10 +281,12 @@ def req_handlers():
             #db.session.query(func.sum(File.kb_size)).all()
             if db_kb_size+kb_size > Config()['max_kb']:
                 raise Exception("Repo is full")
+            rev_seq = Seq.query.filter_by(id=REVISION_SEQ_ID).one()
+            rev_seq.v += 1
             file = File(uuid_name=uuid_fn, nonce=nonce,
-                        enc_meta=enc_file_meta, kb_size=kb_size)
+                        enc_meta=enc_file_meta, kb_size=kb_size, rev=rev_seq.v)
             db.session.add(file)
-            db.session.commit()
+            db.session.flush()
             fa = FileAccess(user_id=user_id, file_id=file.id,
                             enc_file_key=enc_file_key, hidden_fn=hidden_fn,
                             can_modify=True, accepted=True)
@@ -303,6 +319,8 @@ def req_handlers():
             file.kb_size = kb_size
             old_path = os.path.join(save_path, file.uuid_name)
             file.uuid_name = uuid.uuid4().hex
+            rev_seq = Seq.query.filter_by(id=REVISION_SEQ_ID).one()
+            file.rev = rev_seq.v = rev_seq.v+1
             new_path = os.path.join(save_path, file.uuid_name)
             os.rename(temp_path, new_path)
             os.remove(old_path)
@@ -318,6 +336,20 @@ def req_handlers():
             File.query.filter_by(id=file_id).delete()
         fa_q.delete()
         db.session.commit()
+
+    @handler("GET", auth=False)
+    def GET_REVISION():
+        return Seq.query.filter_by(id=REVISION_SEQ_ID).value(Seq.v)
+
+    @handler("GET")
+    def GET_NEW_REVISIONS(user_id, client_rev):
+        rev = Seq.query.filter_by(id=REVISION_SEQ_ID).value(Seq.v)
+        if client_rev == rev:
+            return []
+        r = db.session.query(File.id, File.rev).filter(
+                File.rev > client_rev, File.id==FileAccess.file_id,
+                FileAccess.user_id==user_id, FileAccess.accepted==True).all()
+        return r
 
     @handler("GET", auth=False)
     def HELP():
@@ -379,7 +411,7 @@ def setup():
     from json import dump
     with open(conf_fn,'w') as f:
         dump(opts,f)
-    db.create_all()
+    create_db()
     if not os.path.exists("files"):
         os.mkdir("files")
     print("application successfully set up... probably")
@@ -404,6 +436,6 @@ if __name__ == '__main__':
             if os.path.exists(db_path):
                 os.remove(db_path)
             os.mkdir("files")
-            db.create_all()
+            create_db()
             print("recreated all the thigns")
             app.run(debug=True)
