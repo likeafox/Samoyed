@@ -210,6 +210,13 @@ def req_handlers():
         return db.session.query(*ks).filter_by(user_id=user_id, accepted=True).all()
 
     @handler("GET")
+    def GET_FILE_ENTRY(user_id, file_id):
+        ks=(FileAccess.file_id, FileAccess.enc_file_key,
+            FileAccess.hidden_fn, FileAccess.can_modify)
+        return db.session.query(*ks).filter_by(
+            user_id=user_id, file_id=file_id, accepted=True).one()
+
+    @handler("GET")
     def GET_UNACCEPTED_FILE_LIST(user_id):
         q = db.session.query(FileAccess.file_id).filter_by(
                 user_id=user_id, accepted=False)
@@ -345,11 +352,11 @@ def req_handlers():
     def GET_NEW_REVISIONS(user_id, client_rev):
         rev = Seq.query.filter_by(id=REVISION_SEQ_ID).value(Seq.v)
         if client_rev == rev:
-            return []
+            return {'server_rev':rev, 'rev_list':[]}
         r = db.session.query(File.id, File.rev).filter(
                 File.rev > client_rev, File.id==FileAccess.file_id,
                 FileAccess.user_id==user_id, FileAccess.accepted==True).all()
-        return r
+        return {'server_rev':rev, 'rev_list':r}
 
     @handler("GET", auth=False)
     def HELP():
