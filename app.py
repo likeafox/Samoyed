@@ -153,6 +153,7 @@ def req_validators():
         'hidden_fn': [b64_validate, FileAccess.hidden_fn],
         'nonce': [b64_validate, File.nonce],
         'enc_file_meta': [b64_validate, File.enc_meta],
+        'client_rev': [int_validate],
     }
 
 def validate_request_params(obj):
@@ -225,7 +226,7 @@ def req_handlers():
     @handler("GET")
     def GET_FILE_META(user_id, file_id):
         fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-        return jsonize(fa.file, "nonce enc_meta")
+        return json.loads(jsonize(fa.file, "nonce enc_meta"))
 
     @handler("GET")
     def GET_FILE_DATA(user_id, file_id, start_end):
@@ -310,28 +311,27 @@ def req_handlers():
         if not fa.can_modify or not fa.accepted:
             raise Exception("You can't modify that file")
         file = File.query.filter_by(id=file_id).one()
-        with tempfile.TemporaryDirectory() as tempdir:
-            temp_path = os.path.join(tempdir, file.uuid_name)
-            request.files['file'].save(temp_path)
-            file_size = os.path.getsize(temp_path)
-            if file_size > Config()['max_file_size']:
-                raise Exception("Files't toooo big")
-            kb_size = ((file_size - 1) // 1024) + 1
-            from sqlalchemy.sql import func
-            db_kb_size = db.session.query(func.sum(File.kb_size)).all()
-            if db_kb_size+(kb_size-file.kb_size) > Config()['max_kb']:
-                raise Exception("Repo is full")
-            file.nonce = nonce
-            file.enc_meta = enc_file_meta
-            file.kb_size = kb_size
-            old_path = os.path.join(save_path, file.uuid_name)
-            file.uuid_name = uuid.uuid4().hex
-            rev_seq = Seq.query.filter_by(id=REVISION_SEQ_ID).one()
-            file.rev = rev_seq.v = rev_seq.v+1
-            new_path = os.path.join(save_path, file.uuid_name)
-            os.rename(temp_path, new_path)
-            os.remove(old_path)
-            db.session.commit()
+
+        new_uuid_name = uuid.uuid4().hex
+        new_path = os.path.join(save_path, new_uuid_name)
+        request.files['file'].save(new_path)
+        file_size = os.path.getsize(new_path)
+        if file_size > Config()['max_file_size']:
+            raise Exception("Files't toooo big")
+        kb_size = ((file_size - 1) // 1024) + 1
+        from sqlalchemy.sql import func
+        db_kb_size = db.session.query(func.sum(File.kb_size)).scalar()
+        if db_kb_size+(kb_size-file.kb_size) > Config()['max_kb']:
+            raise Exception("Repo is full")
+        file.nonce = nonce
+        file.enc_meta = enc_file_meta
+        file.kb_size = kb_size
+        old_path = os.path.join(save_path, file.uuid_name)
+        file.uuid_name = new_uuid_name
+        rev_seq = Seq.query.filter_by(id=REVISION_SEQ_ID).one()
+        file.rev = rev_seq.v = rev_seq.v+1
+        os.remove(old_path)
+        db.session.commit()
 
     @handler("POST")
     def UNLINK_FILE(user_id, file_id):
