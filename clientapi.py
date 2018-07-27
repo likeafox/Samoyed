@@ -3,8 +3,8 @@ from base64 import *
 from pathlib import Path, PurePath
 from contextlib import contextmanager
 from types import SimpleNamespace
-import zlib, secrets, uuid, time, itertools,\
-    hashlib, os, os.path, struct, json
+import zlib, uuid, time, itertools, hashlib,\
+       os, os.path, struct, json
 
 #imports: modules
 from requests import request
@@ -31,15 +31,27 @@ class SomeRandomness:
     quality, and only uses one pool. This isn't seen as
     a big deal because all the prng-ing of this class is all
     ultimately for the purpose of supplementing the underlying
-    OS's crypto (which is available via python 3.6's built-in
-    secrets module).'''
+    OS's crypto, which is available via python 3.6's built-in
+    secrets module.  If the secrets module is not available,
+    attempt to fall back to PyCryptodome, which also seems good.'''
     #for future reference:
     #https://www.schneier.com/academic/paperfiles/fortuna.pdf
 
     def __init__(self):
+        try:
+            from secrets import token_bytes as f
+        except ModuleNotFoundError:
+            try:
+                from Crypto.Random import get_random_bytes as f
+            except ModuleNotFoundError as e:
+                msg = "Neither 'secrets' module nor 'Crypto.Random' module "+\
+                      "were found"
+                raise e.__class__(msg)
+        self.system_random_bytes = f
+
         #try to not have a dry pool at the start
         self.pool = hashlib.sha256(uuid.uuid1().bytes)
-        self.pool.update(secrets.token_bytes(16))
+        self.pool.update(self.system_random_bytes(16))
 
     def timeseeder(self, f):
         def d(*args,**kwargs):
@@ -53,7 +65,7 @@ class SomeRandomness:
     def reap(self, length):
         aes = AESModeOfOperationCTR(self.pool.digest())
         random1 = aes.encrypt(bytes(length))
-        random2 = secrets.token_bytes(length)
+        random2 = self.system_random_bytes(length)
         self.pool = hashlib.sha256(aes.encrypt(bytes(32)))
         return bytes(a^b for a,b in zip(random1, random2))
 
