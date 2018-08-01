@@ -14,8 +14,9 @@ from kivy.graphics import Color, Rectangle
 from kivy.properties import ListProperty
 from kivy.uix.scrollview import ScrollView
 from kivy.core.window import Window
+from kivy.clock import Clock
 import jnius
-import json
+import time, socket, json
 
 #local import
 from buildnum import BUILD_NUMBER
@@ -43,7 +44,8 @@ def post_msg(msg, debug=False):
     if debug and not DEBUG:
         return
     msg = str(msg)
-    print(msg)
+    for i in range(0,len(msg),2000):
+        print(msg[i:i+2000])
     find('output').text += msg + '\n'
 
 class Row(BoxLayout):
@@ -55,7 +57,12 @@ class OnSwitch(Switch):
         self.bind(active=__class__.was_switched)
 
     def was_switched(self, value):
-        find('status').update('stopped' if not value else 'startup')
+        app = App.get_running_app()
+        if value:
+            app.activity.start_service(
+                'Python service','Kivy Python service started','')
+        else:
+            app.service_comm.send_exit()
 
 class Status(Label):
     def __init__(self, **kwargs):
@@ -204,8 +211,85 @@ Builder.load_string('''
         height: self.minimum_height
 ''')
 
+class ServiceCommunicator:
+    PING_INTERVAL = 0.6
+    PROC_INTERVAL = 0.25
+    DO_PRINT = True
+
+    def __init__(self, activity):
+        self.activity = activity
+        self.last_pong = 0.0
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setblocking(False)
+        self.sock.bind(('127.0.0.1', 0))
+        self.refresh_comm_details()
+        self.online = False
+        self.events = []
+
+    def refresh_comm_details(self):
+        shared_pref = self.activity.getSharedPreferences(VERSION_STR,0)
+        self.comm = shared_pref.contains('comm')
+        if self.comm:
+            self.serv_port, self.comm_code = json.loads(shared_pref.getString('comm',None))
+        #    post_msg("{} {}".format(self.serv_port, self.comm_code),True)
+        #else:
+        #    post_msg("no comm details",True)
+
+    def send(self, v):
+        if not self.comm:
+            return
+        data = {'code':self.comm_code, 'value':v}
+        packed_data = json.dumps(data).encode()
+        self.sock.sendto(packed_data, ('127.0.0.1', self.serv_port))
+
+    def recv(self):
+        while True:
+            try:
+                packed_data, addr = self.sock.recvfrom(1024)
+            except BlockingIOError:
+                return None
+            try:
+                data = json.loads(packed_data.decode())
+                if data['code'] == self.comm_code and\
+                   data['value'] is not None:
+                    return data['value']
+            except:
+                pass
+
+    def send_exit(self):
+        self.send('exit')
+
+    def proc(self):
+        while True:
+            msg = self.recv()
+            if msg is None:
+                break
+            #handle incoming message
+            self.last_pong = time.time()
+            type_, v = msg
+            if type_ == 'info' and self.DO_PRINT:
+                post_msg(v)
+        self.online = (time.time() - self.last_pong) < \
+                      (max(self.PING_INTERVAL, self.PROC_INTERVAL) * 3)
+
+    def start(self):
+        self.stop()
+        new_intervals = [
+            (lambda dt: self.send('ping'), self.PING_INTERVAL),
+            (lambda dt: self.proc(), self.PROC_INTERVAL),
+            (lambda dt: self.refresh_comm_details(), self.PING_INTERVAL * 20),
+            ]
+        self.events = [Clock.schedule_interval(f,t) for f,t in new_intervals]
+
+    def stop(self):
+        for e in self.events:
+            e.cancel()
+        self.events = []
+
 class SamoyedApp(App):
     def build(self):
+        PythonActivity = jnius.autoclass('org.kivy.android.PythonActivity')
+        self.activity = PythonActivity.mActivity
         self.title = FULL_TITLE
         r = ScrollView()
         return r
@@ -221,12 +305,13 @@ class SamoyedApp(App):
     def on_start(self):
         post_msg(FULL_TITLE)
 
-        PythonActivity = jnius.autoclass('org.kivy.android.PythonActivity')
-        self.activity = PythonActivity.mActivity
-
         #init controls
         find('status').update('stopped')
         find().load()
+
+        self.service_comm = ServiceCommunicator(self.activity)
+        self.service_comm.start()
+        self.ue = Clock.schedule_interval(self.update_service_status, 0.25)
 
         #path_obj = activity.getFilesDir()
         #files_dir = path_obj.getAbsolutePath()
@@ -235,8 +320,10 @@ class SamoyedApp(App):
         #    #import traceback
         #    #r = traceback.format_exc()
         #    raise
-            
+
+    def update_service_status(self, dt):
+        status = 'running' if self.service_comm.online else 'stopped'
+        find('status').update(status)
 
 if __name__ == '__main__':
     SamoyedApp().run()
-
