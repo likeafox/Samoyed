@@ -40,10 +40,10 @@ class SomeRandomness:
     def __init__(self):
         try:
             from secrets import token_bytes as f
-        except ModuleNotFoundError:
+        except ImportError:
             try:
                 from Crypto.Random import get_random_bytes as f
-            except ModuleNotFoundError as e:
+            except ImportError as e:
                 msg = "Neither 'secrets' module nor 'Crypto.Random' module "+\
                       "were found"
                 raise e.__class__(msg)
