@@ -50,7 +50,7 @@ class SomeRandomness:
         self.system_random_bytes = f
 
         #try to not have a dry pool at the start
-        self.pool = hashlib.sha256(uuid.uuid1().bytes)
+        self.pool = hashlib.sha256(uuid.uuid1(node=0).bytes)
         self.pool.update(self.system_random_bytes(16))
 
     def timeseeder(self, f):

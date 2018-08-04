@@ -17,7 +17,7 @@ else:
     COMM_CODE = Crypto.Random.get_random_bytes(16).hex()
     save_shared([COMM_PORT, COMM_CODE])
 
-import socket
+import socket, sys
 from time import sleep
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -34,6 +34,35 @@ else:
     raise Exception("Exhausted UDP service ports to try")
 sock.setblocking(False)
 
+Environment = jnius.autoclass('android.os.Environment')
+x_store_state = Environment.getExternalStorageState()
+print("External storage: "+ x_store_state.__repr__())
+root_dir = service.getExternalFilesDir(None).toString()
+from clientapi import *
+print("Loaded clientapi.py")
+settings_json = shared_pref.getString('settings','{}')
+settings = json.loads(settings_json)
+print("Loaded settings")
+
+try:
+    repo = Repo(settings['server_url'], settings['access_key'])
+except Exception as e:
+    import traceback
+    e_info = traceback.format_exc()
+    for i in range(20):
+        try:
+            _, addr = sock.recvfrom(128)
+        except BlockingIOError:
+            pass
+        else:
+            info = (e.__repr__() + "\n" + e_info)[:70]
+            response = {'code':COMM_CODE, 'value':['info',info]}
+            send_data = json.dumps(response).encode()
+            sock.sendto(send_data, addr)
+            sys.exit(0)
+        sleep(1)
+
+print("created repo.  entering main loop")
 
 while True:
     #get network requests
@@ -57,7 +86,6 @@ while True:
             send_data = json.dumps(response).encode()
             sock.sendto(send_data, addr)
         elif msg == 'exit':
-            import sys
             sys.exit(0) #this is apparently considered a crash by android
 
     sleep(0.5)
