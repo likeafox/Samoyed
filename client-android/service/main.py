@@ -17,7 +17,7 @@ else:
     COMM_CODE = Crypto.Random.get_random_bytes(16).hex()
     save_shared([COMM_PORT, COMM_CODE])
 
-import socket, sys
+import socket, sys, os, os.path
 from time import sleep
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -37,32 +37,44 @@ sock.setblocking(False)
 Environment = jnius.autoclass('android.os.Environment')
 x_store_state = Environment.getExternalStorageState()
 print("External storage: "+ x_store_state.__repr__())
-root_dir = service.getExternalFilesDir(None).toString()
+app_root_dir = service.getExternalFilesDir(None).toString()
+repo_root_dir = os.path.realpath(os.path.join(app_root_dir, "repo"))
+if not os.path.exists(repo_root_dir):
+    print("Repo dir does not exist. creating "+repo_root_dir)
+    os.mkdir(repo_root_dir)
 from clientapi import *
 print("Loaded clientapi.py")
 settings_json = shared_pref.getString('settings','{}')
 settings = json.loads(settings_json)
 print("Loaded settings")
 
-try:
-    repo = Repo(settings['server_url'], settings['access_key'])
-except Exception as e:
+def wait_send_exc(e):
     import traceback
     e_info = traceback.format_exc()
-    for i in range(20):
+    info = (e.__repr__() + "\n" + e_info)[:70]
+    for i in range(21):
+        if i>0:
+            sleep(1)
         try:
             _, addr = sock.recvfrom(128)
         except BlockingIOError:
             pass
         else:
-            info = (e.__repr__() + "\n" + e_info)[:70]
             response = {'code':COMM_CODE, 'value':['info',info]}
             send_data = json.dumps(response).encode()
             sock.sendto(send_data, addr)
-            sys.exit(0)
-        sleep(1)
+            return
 
-print("created repo.  entering main loop")
+try:
+    repo = Repo(settings['server_url'], settings['access_key'])
+    user = repo.login(settings['nickname'], settings['user_key'], repo_root_dir)
+except Exception as e:
+    wait_send_exc(e)
+    raise
+
+print("created repo objects.  entering main loop")
+last_proc = 0
+proc_interval = 3
 
 while True:
     #get network requests
@@ -87,5 +99,18 @@ while True:
             sock.sendto(send_data, addr)
         elif msg == 'exit':
             sys.exit(0) #this is apparently considered a crash by android
+
+    t = time.time()
+    if t > last_proc + proc_interval:
+        last_proc = t
+        try:
+            user.handle_filesystem_changes()
+            user.get_remote_file_listing_updates()
+            user.handle_file_changes()
+            user.auto_upload()
+            user.sync('up','autodown')
+        except Exception as e:
+            wait_send_exc(e)
+            raise
 
     sleep(0.5)
