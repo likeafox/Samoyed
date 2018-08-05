@@ -1,3 +1,4 @@
+#! python3.6
 from flask import Flask, request
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import Column, Integer, String, Boolean, Sequence,\
@@ -5,7 +6,10 @@ from sqlalchemy import Column, Integer, String, Boolean, Sequence,\
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm.exc import *
 
-import json, uuid, os, os.path, tempfile
+import sys, os, os.path, json, uuid
+
+app_root = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, app_root)
 
 # constants
 save_path = "files"
@@ -429,14 +433,14 @@ def setup():
 if __name__ == '__main__':
     import sys
     if len(sys.argv) != 2:
-        print("Usage: api.py <command>")
+        print("Usage: server.py <command>")
     else:
         cmd = sys.argv[1].upper()
         if cmd == "TEST":
             app.run(debug=True)
         elif cmd == "SETUP":
             setup()
-        elif cmd == "CLEANTEST":
+        elif cmd == "CLEAN":
             if os.path.exists(save_path):
                 import shutil
                 shutil.rmtree(save_path)
@@ -445,4 +449,7 @@ if __name__ == '__main__':
             os.mkdir("files")
             create_db()
             print("recreated all the thigns")
-            app.run(debug=True)
+            #app.run(debug=True)
+else:
+    os.chdir(app_root)
+    application = app
