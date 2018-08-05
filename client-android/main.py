@@ -13,6 +13,7 @@ from kivy.uix.widget import Widget
 from kivy.graphics import Color, Rectangle
 from kivy.properties import ListProperty
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.button import Button
 from kivy.core.window import Window
 from kivy.clock import Clock
 import jnius
@@ -80,6 +81,25 @@ class Status(Label):
         self.color = [0,0,0,1] if sum(color) > 3 else [1,1,1,1]
         if self.parent is not None:
             self.parent.color = color
+
+class GenButton(Button):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(on_press=__class__.gen_key)
+
+    def gen_key(self):
+        st_t = time.time()
+        password_box = find('password')
+        password = str(password_box.text).encode()
+        if len(password) < 1:
+            return
+        from hashlib import pbkdf2_hmac
+        key = pbkdf2_hmac('sha256', password, b'testsalt', 1000000)[:16]
+        post_msg("Generated key in {:.3f} seconds.".format(time.time() - st_t))
+        #set UI
+        import base64
+        password_box.text = ''
+        find('user_key').text = base64.b64encode(key).decode()
 
 class InvalidSettings(Exception): pass
 
@@ -183,7 +203,7 @@ Builder.load_string('''
             text: 'password'
         ConfigText:
             id: password
-        Button:
+        GenButton:
             size_hint: None, None
             pos_hint: {'center_y':0.5}
             size: self.texture_size[0] + mm(4), sp(15) + mm(4)

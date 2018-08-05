@@ -201,7 +201,7 @@ def req_handlers():
     @handler("POST", auth=False)
     def NEW_USER(name, key_hash):
         if User.query.count() >= Config()['max_users']:
-            raise Exception("fuck off")
+            raise Exception("too many users")
         #http://docs.sqlalchemy.org/en/latest/errors.html#integrityerror
         user = User(name=name, key_hash=key_hash)
         db.session.add(user)
