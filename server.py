@@ -13,6 +13,7 @@ sys.path.insert(0, app_root)
 
 #local imports
 import protocol
+assert protocol.VERSION == "1r1"
 
 # constants
 save_path = "files"
@@ -35,13 +36,12 @@ db = SQLAlchemy(app)
 
 # Utilities
 def call(f): return f()
-def jsonize(obj, attr_names:str):
-    '''Use jsonize() to turn obj into a json object by
+def dictify(obj, attr_names:str):
+    '''Use dictify() to turn obj into a dict by
     cherry picking which attributes you want'''
     if type(attr_names) == str:
         attr_names = attr_names.split()
-    d = dict(((a,getattr(obj,a)) for a in attr_names))
-    return json.dumps(d)
+    return dict(((a,getattr(obj,a)) for a in attr_names))
 
 
 
@@ -129,8 +129,7 @@ def GET_USER(key_hash):
         user = User.query.filter_by(key_hash=key_hash).one()
     except NoResultFound:
         raise NoResult("That user does not exist.")
-    print(user.name)
-    return json.loads(jsonize(user, "id name"))
+    return dictify(user, "id name")
 
 def GET_USER_NAMES():
     return [x for (x,) in db.session.query(User.name).all()]
@@ -145,15 +144,16 @@ def NEW_USER(name, key_hash):
     db.session.commit()
     return user.id
 
+def file_entry_query(**kwargs):
+    dbks = [ getattr(FileAccess, n) for n in protocol.FileEntry.fields ]
+    return db.session.query(*dbks).filter_by(**kwargs)
+
 def GET_FILE_LIST(user_id):
-    ks=(FileAccess.file_id, FileAccess.enc_file_key,
-        FileAccess.hidden_fn, FileAccess.can_modify)
-    return db.session.query(*ks).filter_by(user_id=user_id, accepted=True).all()
+    return [ list(x) for x in \
+             file_entry_query(user_id=user_id, accepted=True).all() ]
 
 def GET_FILE_ENTRY(user_id, file_id):
-    ks=(FileAccess.file_id, FileAccess.enc_file_key,
-        FileAccess.hidden_fn, FileAccess.can_modify)
-    return db.session.query(*ks).filter_by(
+    return file_entry_query(
         user_id=user_id, file_id=file_id, accepted=True).one()
 
 def GET_UNACCEPTED_FILE_LIST(user_id):
@@ -163,7 +163,7 @@ def GET_UNACCEPTED_FILE_LIST(user_id):
 
 def GET_FILE_META(user_id, file_id):
     fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-    return json.loads(jsonize(fa.file, "nonce enc_meta"))
+    return dictify(fa.file, "nonce enc_meta")
 
 def GET_FILE_DATA(user_id, file_id, start_end):
     start, end = start_end
@@ -280,11 +280,13 @@ def GET_REVISION():
 def GET_NEW_REVISIONS(user_id, client_rev):
     rev = Seq.query.filter_by(id=REVISION_SEQ_ID).value(Seq.v)
     if client_rev == rev:
-        return {'server_rev':rev, 'rev_list':[]}
-    r = db.session.query(File.id, File.rev).filter(
+        rl = []
+    else:
+        q = db.session.query(File.id, File.rev).filter(
             File.rev > client_rev, File.id==FileAccess.file_id,
-            FileAccess.user_id==user_id, FileAccess.accepted==True).all()
-    return {'server_rev':rev, 'rev_list':r}
+            FileAccess.user_id==user_id, FileAccess.accepted==True)
+        rl = [ list(x) for x in q.all() ]
+    return {'server_rev':rev, 'rev_list':rl}
 
 # set handlers
 for n,o in globals().copy().items():
