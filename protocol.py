@@ -73,6 +73,29 @@ class RepoInfo(Data):
                 return False
         return True
 
+class Record(Data):
+    @classmethod
+    def validate(cls, v):
+        if type(v) is not list or len(v) is not len(cls.fields):
+            return False
+        return all(t.validate(x) for x,t in zip(v, cls.fields.values()))
+    @classmethod
+    def to_dict(cls, v):
+        if not cls.validate(v):
+            raise TypeError("not a valid {} type".format(cls.__name__))
+        return dict(zip(cls.fields, v))
+
+class FileEntry(Record):
+    fields = dict(
+        file_id = Uint,
+        enc_file_key = B64KeySized,
+        hidden_fn = B64KeySized,
+        can_modify = Bool
+        )
+
+class FileRev(Record):
+    fields = { 'id': Uint, 'rev': Uint }
+
 
 
 #requests
@@ -121,17 +144,12 @@ class NEW_USER(Request):
 class GET_FILE_ENTRY(Request):
     auth = True
     params = { 'user_id': Uint, 'file_id': Uint }
-    result = dict(
-        file_id = Uint,
-        enc_file_key = B64KeySized,
-        hidden_fn = B64KeySized,
-        can_modify = Bool
-        )
+    result = FileEntry
 
 class GET_FILE_LIST(Request):
     auth = True
     params = { 'user_id': Uint }
-    result = [ GET_FILE_ENTRY.result ]
+    result = [ FileEntry ]
 
 class GET_UNACCEPTED_FILE_LIST(Request):
     auth = True
@@ -141,7 +159,7 @@ class GET_UNACCEPTED_FILE_LIST(Request):
 class GET_FILE_META(Request):
     auth = True
     params = { 'user_id': Uint, 'file_id': Uint }
-    result = FileMetaBlock
+    result = { 'nonce': B64KeySized, 'enc_meta': FileMetaBlock }
 
 class GET_FILE_DATA(Request):
     auth = True
@@ -209,7 +227,7 @@ class GET_REVISION(Request):
 class GET_NEW_REVISIONS(Request):
     auth = True
     params = { 'user_id': Uint, 'client_rev': Uint }
-    result = { 'server_rev': Uint, 'rev_list': [ Uint ] }
+    result = { 'server_rev': Uint, 'rev_list': [ FileRev ] }
 
 
 
