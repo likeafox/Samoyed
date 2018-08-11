@@ -61,6 +61,18 @@ class SeqRange(Data):
             elif type(w) is not int or w < 0: return False
         return has_None or v[0] <= v[1]
 
+class RepoInfo(Data):
+    @staticmethod
+    def validate(v):
+        if type(v) is not dict:
+            return False
+        k_format = re.compile(r"^[a-z](_?[a-z0-9]+)*$")
+        for k,vv in v.items():
+            if not k_format.match(k) or \
+               (not Uint.validate(vv) and type(vv) is not str):
+                return False
+        return True
+
 
 
 #requests
@@ -72,15 +84,27 @@ class Request:
     result = None
     file = False
     auth = False
+    auth_params = { 'user_id': Uint, 'key_hash': B64KeySized }
     @staticmethod
     def handler():
         raise NotImplemented()
+    def client_params(self):
+        if not auth:
+            return self.params
+        params = self.params.copy()
+        for k in (set(params) & set(self.auth_params)):
+            assert params[k] == self.auth_params[k]
+        params.update(auth_params)
+        return params
 
 class SERV_PROTOCOL_VERSION(Request):
     result = VersionString
     @staticmethod
     def handler():
         return VERSION
+
+class GET_REPO_INFO(Request):
+    result = RepoInfo
 
 class GET_USER(Request):
     params = { 'key_hash': B64KeySized }
@@ -186,6 +210,40 @@ class GET_NEW_REVISIONS(Request):
     auth = True
     params = { 'user_id': Uint, 'client_rev': Uint }
     result = { 'server_rev': Uint, 'rev_list': [ Uint ] }
+
+
+
+#utility functions
+
+def extract_args(param_definition, data):
+    assert type(param_definition) is dict
+    def gen():
+        for name,datatype in param_definition.items():
+            try:
+                v = data[name]
+            except KeyError:
+                TypeError(name)
+            if not datatype.validate(v):
+                raise ValueError(name)
+            yield name,v
+    return dict(gen())
+
+def result_validator(definition, data):
+    if type(definition) is type and issubclass(definition, Data):
+        return definition.validate(data)
+    elif type(definition) == type(data):
+        if type(definition) is list:
+            assert len(definition) == 1
+            sub_def = definition[0]
+            return all(result_validator(sub_def, x) for x in data)
+        elif type(definition) is dict:
+            if set(definition) != set(data):
+                return False
+            return all(result_validator(sub_def, data[k]) \
+                       for k,sub_def in definition.items())
+        elif definition is None:
+            return True
+    return False
 
 
 

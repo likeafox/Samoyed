@@ -11,6 +11,7 @@ from requests import request
 
 #imports: "local"
 from aes import AES, AESModeOfOperationCTR
+import protocol
 
 #global constants
 CONSTS = SimpleNamespace(
@@ -204,13 +205,12 @@ class Repo:
     def __init__(self, url, access_key):
         self.url = url
         self.access_key = access_key
-        self.server_req_types = dict(self.req("HELP"))
         self.server_config = self.req("GET_REPO_INFO")
 
     @some_randomness.timeseeder
     def req(self, req_type, params={}, **kwargs):
         print(req_type)
-        method = "get" if req_type == "HELP" else self.server_req_types[req_type]
+        method = protocol.request_types[req_type].method
         p = {'access_key':self.access_key,
              'req_type':req_type,
              'params':json.dumps(params)}
