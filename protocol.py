@@ -1,4 +1,12 @@
-VERSION = "1r1"
+#! Python3.7
+
+# Copyright: Jason Forbes
+
+VERSION = "2r1"
+
+# Require Python 3.7 or later
+import sys
+assert (sys.version_info.major, sys.version_info.minor) >= (3, 7)
 
 import base64, re
 
@@ -6,12 +14,24 @@ import base64, re
 
 #data types
 
-class Data: pass
-
-class Uint(Data):
+class Data:
     @staticmethod
     def validate(v):
-        return type(v) is int and v in range(0x7fffffff)
+        raise NotImplemented()
+
+class UInt(Data):
+    bits = 32
+    @classmethod
+    def validate(cls, v):
+        return type(v) is int and v in range(2 ** cls.bits)
+
+class SafeULong(UInt):
+    """SafeULong is a 53-bit unsigned integer.
+    
+    Apparently, according to the spec, JSON only officially supports integers
+    up to 2^53-1. It has to do with the way numbers are represented in data
+    in Javascript; all real numbers are actually floats."""
+    bits = 53
 
 class Bool(Data):
     @staticmethod
@@ -34,9 +54,6 @@ class B64(Data):
 class B64KeySized(B64):
     encoded_length = 24
 
-class FileMetaBlock(B64):
-    encoded_length = 64
-
 class Word(Data):
     minmax_lengths = (None, None)
     @classmethod
@@ -44,24 +61,10 @@ class Word(Data):
         exp = r'^\w{{{},{}}}$'.format(*cls.minmax_lengths)
         return type(v) is str and re.match(exp, v) is not None
 
-class Nickname(Word):
-    minmax_lengths = (3, 24)
-
 class VersionString(Word):
     minmax_lengths = (1, 10)
 
-class SeqRange(Data):
-    @staticmethod
-    def validate(v):
-        if type(v) is not list or len(v) != 2:
-            return False
-        has_None=False
-        for w in v:
-            if w is None: has_None=True
-            elif type(w) is not int or w < 0: return False
-        return has_None or v[0] <= v[1]
-
-class RepoInfo(Data):
+class ServInfo(Data):
     @staticmethod
     def validate(v):
         if type(v) is not dict:
@@ -69,7 +72,7 @@ class RepoInfo(Data):
         k_format = re.compile(r"^[a-z](_?[a-z0-9]+)*$")
         for k,vv in v.items():
             if not k_format.match(k) or \
-               (not Uint.validate(vv) and type(vv) is not str):
+               (not SafeULong.validate(vv) and type(vv) is not str):
                 return False
         return True
 
@@ -78,23 +81,38 @@ class Record(Data):
     def validate(cls, v):
         if type(v) is not list or len(v) is not len(cls.fields):
             return False
+        # Python documentation says: "Changed in version 3.7: Dictionary
+        # order is guaranteed to be insertion order", therefore
+        # iterating over this in an order-dependent way is safe.
         return all(t.validate(x) for x,t in zip(v, cls.fields.values()))
     @classmethod
     def to_dict(cls, v):
         if not cls.validate(v):
-            raise TypeError("not a valid {} type".format(cls.__name__))
+            raise TypeError("not a valid {} object".format(cls.__name__))
         return dict(zip(cls.fields, v))
 
-class FileEntry(Record):
+class SpoolMetadata(Record):
     fields = dict(
-        file_id = Uint,
-        enc_file_key = B64KeySized,
-        hidden_fn = B64KeySized,
-        can_modify = Bool
-        )
+        block_size = UInt,
+        block_count = SafeULong,
+        head_offset = SafeULong,
+        tail_offset = SafeULong,
+        annotation = SpoolAnnotation
+    )
 
-class FileRev(Record):
-    fields = { 'id': Uint, 'rev': Uint }
+class SpoolAccessInfo(Record):
+    fields = dict(
+        spool_id = UInt,
+        can_read = Bool,
+        can_append = Bool,
+        can_truncate = Bool
+    )
+
+class SpoolAnnotation(Data):
+    @staticmethod
+    def validate(v):
+        exp = r"^[ \w\-+=/,.!#:;]{0,32}$"
+        return type(v) is str and re.match(exp, v) is not None
 
 
 
@@ -106,18 +124,18 @@ class Request:
     params = {}
     result = None
     file = False
-    auth = False
-    auth_params = { 'user_id': Uint, 'key_hash': B64KeySized }
+    owner_only = False
+    owner_params = { 'owner_key': B64KeySized }
     @staticmethod
     def handler():
         raise NotImplemented()
     def client_params(self):
-        if not auth:
+        if not owner_only:
             return self.params
         params = self.params.copy()
-        for k in (set(params) & set(self.auth_params)):
-            assert params[k] == self.auth_params[k]
-        params.update(auth_params)
+        for k in (set(params) & set(self.owner_params)):
+            assert params[k] == self.owner_params[k]
+        params.update(owner_params)
         return params
 
 class SERV_PROTOCOL_VERSION(Request):
@@ -126,108 +144,60 @@ class SERV_PROTOCOL_VERSION(Request):
     def handler():
         return VERSION
 
-class GET_REPO_INFO(Request):
-    result = RepoInfo
+class SERV_INFO(Request):
+    result = ServInfo
 
-class GET_USER(Request):
-    params = { 'key_hash': B64KeySized }
-    result = { 'id': Uint, 'name': Nickname }
+class SPOOL_LIST(Request):
+    owner_only = True
+    result = [ UInt ]
 
-class GET_USER_NAMES(Request):
-    result = [ Nickname ]
+class SPOOL_NEW(Request):
+    owner_only = True
+    params = dict(
+        id = UInt,
+        block_size = UInt,
+        block_count = SafeULong,
+        annotation = SpoolAnnotation
+    )
 
-class NEW_USER(Request):
-    method = "POST"
-    params = { 'name': Nickname, 'key_hash': B64KeySized }
-    result = Uint
+class SPOOL_DELETE(Request):
+    owner_only = True
+    params = { 'id': UInt }
 
-class GET_FILE_ENTRY(Request):
-    auth = True
-    params = { 'user_id': Uint, 'file_id': Uint }
-    result = FileEntry
+class ACCESS_LIST(Request):
+    owner_only = True
+    params = { 'spool_id': UInt }
+    result = [ B64KeySized ]
 
-class GET_FILE_LIST(Request):
-    auth = True
-    params = { 'user_id': Uint }
-    result = [ FileEntry ]
+class ACCESS_INFO(Request):
+    owner_only = True
+    params = { 'k': B64KeySized }
+    result = SpoolAccessInfo
 
-class GET_UNACCEPTED_FILE_LIST(Request):
-    auth = True
-    params = { 'user_id': Uint }
-    result = [ Uint ]
+class ACCESS_INFO_UPDATE(Request):
+    owner_only = True
+    params = { 'k': B64KeySized, 'info': SpoolAccessInfo }
 
-class GET_FILE_META(Request):
-    auth = True
-    params = { 'user_id': Uint, 'file_id': Uint }
-    result = { 'nonce': B64KeySized, 'enc_meta': FileMetaBlock }
+class ACCESS_REVOKE(Request):
+    owner_only = True
+    params = { 'k': B64KeySized }
 
-class GET_FILE_DATA(Request):
-    auth = True
-    params = { 'user_id': Uint, 'file_id': Uint, 'start_end': SeqRange }
+class METADATA_FETCH(Request):
+    params = { 'k': B64KeySized }
+    result = SpoolMetadata
+
+class DATA_READ(Request):
+    params = { 'k': B64KeySized,
+        'start_offset': SafeULong,
+        'block_count': UInt }
     result = B64
 
-class GET_FILE_USERS(Request):
-    auth = True
-    params = { 'user_id': Uint, 'file_id': Uint }
-    result = [ Nickname ]
-
-class NEW_FILE_ACCESS(Request):
-    method = "POST"
-    auth = True
-    params = dict(
-        user_id = Uint,
-        file_id = Uint,
-        target_username = Nickname,
-        can_modify = Bool
-        )
-
-class MODIFY_FILE_ACCESS_KEYS(Request):
-    method = "POST"
-    auth = True
-    params = dict(
-        user_id = Uint,
-        file_id = Uint,
-        enc_file_key = B64KeySized,
-        hidden_fn = B64KeySized
-        )
-
-class NEW_FILE(Request):
-    method = "POST"
-    auth = True
+class DATA_APPEND(Request):
     file = True
-    params = dict(
-        user_id = Uint,
-        nonce = B64KeySized,
-        enc_file_meta = FileMetaBlock,
-        enc_file_key = B64KeySized,
-        hidden_fn = B64KeySized
-        )
-    result = Uint
+    params = { 'k': B64KeySized, 'head_offset': SafeULong }
 
-class UPDATE_FILE(Request):
-    method = "POST"
-    auth = True
-    file = True
-    params = dict(
-        user_id = Uint,
-        file_id = Uint,
-        nonce = B64KeySized,
-        enc_file_meta = FileMetaBlock,
-        )
-    result = Uint
-
-class UNLINK_FILE(Request):
-    method = "POST"
-    auth = True
-    params = { 'user_id': Uint, 'file_id': Uint }
-
-class GET_REVISION(Request):
-    result = Uint
-
-class GET_NEW_REVISIONS(Request):
-    auth = True
-    params = { 'user_id': Uint, 'client_rev': Uint }
-    result = { 'server_rev': Uint, 'rev_list': [ FileRev ] }
+class DATA_TRUNCATE(Request):
+    params = { 'k': B64KeySized, 'tail_offset': SafeULong }
 
 
 

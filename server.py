@@ -1,27 +1,28 @@
-#! python3.6
+#! python3.7
+
+# Copyright: Jason Forbes
+
 from flask import Flask, request
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import Column, Integer, String, Boolean, Sequence,\
-                       ForeignKey, PrimaryKeyConstraint
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, BIGINT
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm.exc import *
 
-import sys, os, os.path, json, uuid
+import sys, os, os.path, json
 
 app_root = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, app_root)
 
 #local imports
 import protocol
-assert protocol.VERSION == "1r1"
+assert protocol.VERSION == "2r1"
 
 # constants
-save_path = "files"
+spool_dir = "spools"
 db_path = "test.db"
-public_config_opts = '''max_users max_files max_file_size max_kb
-    user_key_derivation_salt hidden_fn_salt title
-    suggested_root_name'''.split()
-private_config_opts = '''get_access_key post_access_key'''.split()
+public_config_opts = ['max_block_and_data_op_size', 'max_spools',
+    'max_spool_size', 'storage_quota_kb']
+private_config_opts = ['owner_key']
 config_opts = public_config_opts + private_config_opts
 
 
@@ -31,17 +32,6 @@ app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///'+db_path
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
-
-
-
-# Utilities
-def call(f): return f()
-def dictify(obj, attr_names:str):
-    '''Use dictify() to turn obj into a dict by
-    cherry picking which attributes you want'''
-    if type(attr_names) == str:
-        attr_names = attr_names.split()
-    return dict(((a,getattr(obj,a)) for a in attr_names))
 
 
 
@@ -57,100 +47,111 @@ def Config():
 
 
 
-# Data Models
-class File(db.Model):
-    __tablename__ = "files"
-    id = Column(Integer, Sequence('file_id_seq'), primary_key=True)
-    uuid_name = Column(String(32), nullable=False, unique=True)
-    nonce = Column(String(24), nullable=False)
-    enc_meta = Column(String(64), nullable=False)
-    kb_size = Column(Integer, nullable=False)
-    rev = Column(Integer, nullable=False)
-    file_accessors = relationship("FileAccess", back_populates="file")
+# Data Model
+
+class Spool(db.Model):
+    """Spool
+
+    id: is also the filename on disk
+    block_size: spool can only be read/written in increments of this many bytes
+    block_count: size of the spool, in blocks
+    head_offset: measured in blocks
+    owner_annotation: client-define metadata (not used by server)
+    """
+    __tablename__ = "spools"
+    id = Column(Integer(unsigned=True),
+                Sequence('spool_id_seq'), primary_key=True)
+    block_size = Column(Integer(unsigned=True), nullable=False)
+    block_count = Column(BIGINT(unsigned=True), nullable=False)
+    head_offset = Column(BIGINT(unsigned=True), nullable=False)
+    tail_offset = Column(BIGINT(unsigned=True), nullable=False)
+    annotation = Column(String(24), nullable=False)
+    spool_accessors = relationship("SpoolAccess", back_populates="spool")
     def __repr__(self):
-        return "<File {}>".format(self.id)
+        return f"<Spool {self.id}>"
 
-class User(db.Model):
-    __tablename__ = "users"
-    id = Column(Integer, Sequence('user_id_seq'), primary_key=True)
-    name = Column(String(24), nullable=False, unique=True)
-    key_hash = Column(String(24), nullable=False, unique=True)
-    file_accessors = relationship("FileAccess", back_populates="user")
+class SpoolAccess(db.Model):
+    __tablename__ = "spool_accessors"
+    k = Column(String(24), primary_key=True)
+    spool_id = Column(Integer(unsigned=True), ForeignKey('spool.id'))
+    can_read = Column(Boolean, nullable=False)
+    can_append = Column(Boolean, nullable=False)
+    can_truncate = Column(Boolean, nullable=False)
+    spool = relationship("Spool", back_populates="spool_accessors")
     def __repr__(self):
-        return "<User {}>".format(self.name)
-
-class FileAccess(db.Model):
-    __tablename__ = "file_accessors"
-    file_id = Column(Integer, ForeignKey('files.id'))
-    user_id = Column(Integer, ForeignKey('users.id'))
-    enc_file_key = Column(String(24))
-    hidden_fn = Column(String(24), unique=True)
-    can_modify = Column(Boolean, nullable=False)
-    accepted = Column(Boolean, nullable=False)
-    __table_args__ = ( PrimaryKeyConstraint('file_id','user_id'),{},)
-    file = relationship("File", back_populates="file_accessors")
-    user = relationship("User", back_populates="file_accessors")
-    def __repr__(self):
-        return "<FileAccess ({}, {})>".format(self.file_id, self.user_id)
-
-class Seq(db.Model):
-    __tablename__ = "sequences"
-    id = Column(Integer, primary_key=True)
-    v = Column(Integer)
-
-REVISION_SEQ_ID = 1
-
-def create_db():
-    db.create_all()
-    seq = Seq(id=REVISION_SEQ_ID, v=0)
-    db.session.add(seq)
-    db.session.commit()
+        return f"<SpoolAccess ({self.id})>"
 
 
 
-#exceptions
-class RequestException(Exception): code = 400
+# Exceptions
+class RequestException(Exception):
 class InvalidRequest(RequestException): code = 400
 class NoResult(RequestException): code = 404
 class LimitReached(RequestException): code = 403
 class Denied(RequestException): code = 403
+class Conflict(RequestException): code = 409
 
 
+
+# Utilities
+
+def call(f): return f()
+
+def dictify(obj, attr_names:str):
+    '''Use dictify() to turn obj into a dict by
+    cherry picking which attributes you want'''
+    if type(attr_names) == str:
+        attr_names = attr_names.split()
+    return dict(((a,getattr(obj,a)) for a in attr_names))
+
+def count_filesystem_allocation(use_cached):
+    # note: this function is fs only and does not include include db usage
+    this = count_filesystem_allocation
+    if use_cached and hasattr(this, "cached"):
+        return this.cached
+    try:
+        f_bsize = os.statvfs(app_root).f_bsize
+    except:
+        f_bsize = 4096 # if statvfs isn't available just guess a common value
+    to_fs_size = lambda sz: (sz-1 | f_bsize-1) + 1
+    all_spool_sizes_q = db.session.query(Spool.block_size, Spool.block_count)
+    r = this.cached = sum(to_fs_size(sz*cnt) for sz,cnt in all_spool_sizes_q.all())
+    return r
+
+def storage_usage_kb(use_cached=False):
+    if not os.path.exists(db_path):
+        return 0
+    usage = count_filesystem_allocation(use_cached) + os.path.getsize(db_path)
+    return (quota_usage + spool_size - 1) // 1024 + 1
+
+#def spool_query(**kwargs):
+#    dbks = [ getattr(FileAccess, n) for n in protocol.FileEntry.fields ]
+#    return db.session.query(*dbks).filter_by(**kwargs)
 
 
 
 # Request handlers
 
-def GET_REPO_INFO():
+def SERV_INFO():
     return dict(((k, Config()[k]) for k in public_config_opts))
 
-def GET_USER(key_hash):
-    try:
-        user = User.query.filter_by(key_hash=key_hash).one()
-    except NoResultFound:
-        raise NoResult("That user does not exist.")
-    return dictify(user, "id name")
+def SPOOL_LIST():
+    return db.session.query(Spool.id).all()
 
-def GET_USER_NAMES():
-    return [x for (x,) in db.session.query(User.name).all()]
+def SPOOL_NEW(id, block_size, block_count, annotation):
+    if block_size > Config()['max_block_and_data_op_size']:
+        raise Denied("block_size is too big.")
+    spool_size = block_size * block_count
+    if spool_size > Config()['max_spool_size']:
+        raise Denied("Cannot create a spool that big.")
+    if Spool.query.filter_by(id=id).count() != 0:
+        raise Conflict("A spool with that id already exists.")
+    if storage_usage_kb() > Config()['storage_quota_kb']
+        raise Denied("Storage quota reached.")
 
-def NEW_USER(name, key_hash):
-    print(name, key_hash)
-    if User.query.count() >= Config()['max_users']:
-        raise Exception("too many users")
-    #http://docs.sqlalchemy.org/en/latest/errors.html#integrityerror
-    user = User(name=name, key_hash=key_hash)
-    db.session.add(user)
-    db.session.commit()
-    return user.id
+    raise NotImplemented()
 
-def file_entry_query(**kwargs):
-    dbks = [ getattr(FileAccess, n) for n in protocol.FileEntry.fields ]
-    return db.session.query(*dbks).filter_by(**kwargs)
 
-def GET_FILE_LIST(user_id):
-    return [ list(x) for x in \
-             file_entry_query(user_id=user_id, accepted=True).all() ]
 
 def GET_FILE_ENTRY(user_id, file_id):
     return file_entry_query(
@@ -369,7 +370,7 @@ def setup():
     from json import dump
     with open(conf_fn,'w') as f:
         dump(opts,f)
-    create_db()
+    db.create_all()
     if not os.path.exists("files"):
         os.mkdir("files")
     print("application successfully set up... probably")
@@ -394,7 +395,7 @@ if __name__ == '__main__':
             if os.path.exists(db_path):
                 os.remove(db_path)
             os.mkdir("files")
-            create_db()
+            db.create_all()
             print("recreated all the thigns")
             #app.run(debug=True)
 else:
