@@ -4,7 +4,8 @@
 
 from flask import Flask, request
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, BIGINT
+from sqlalchemy import Column, Integer, BIGINT, String, Boolean, \
+    ForeignKey, Sequence
 from sqlalchemy.orm import relationship
 from sqlalchemy.orm.exc import *
 
@@ -59,17 +60,17 @@ class Spool(db.Model):
     owner_annotation: client-define metadata (not used by server)
     """
     __tablename__ = "spools"
-    id = Column(Integer(unsigned=True),
+    id = Column(Integer,
                 Sequence('spool_id_seq'), primary_key=True)
     # starting to think representing spool dimentions in blocks in the database
     # wasn't the best choice, because there's too much room for programmer error
     # in conversion. I could convert everything to bytes except block_size in
     # the db, and still be able to enforce block alignment and implement the
     # API no problem
-    block_size = Column(Integer(unsigned=True), nullable=False)
-    block_count = Column(BIGINT(unsigned=True), nullable=False)
-    head_offset = Column(BIGINT(unsigned=True), nullable=False)
-    tail_offset = Column(BIGINT(unsigned=True), nullable=False)
+    block_size = Column(Integer, nullable=False)
+    block_count = Column(BIGINT, nullable=False)
+    head_offset = Column(BIGINT, nullable=False)
+    tail_offset = Column(BIGINT, nullable=False)
     annotation = Column(String(32), nullable=False)
     accessors = relationship("SpoolAccessor", back_populates="spool")
     def __repr__(self):
@@ -78,7 +79,7 @@ class Spool(db.Model):
 class SpoolAccessor(db.Model):
     __tablename__ = "spool_accessors"
     k = Column(String(24), primary_key=True)
-    spool_id = Column(Integer(unsigned=True), ForeignKey('spool.id'))
+    spool_id = Column(Integer, ForeignKey('spool.id'))
     can_read = Column(Boolean, nullable=False)
     can_append = Column(Boolean, nullable=False)
     can_truncate = Column(Boolean, nullable=False)
@@ -89,7 +90,7 @@ class SpoolAccessor(db.Model):
 
 
 # Exceptions
-class RequestException(Exception):
+class RequestException(Exception): pass
 class InvalidRequest(RequestException): code = 400
 class NoResult(RequestException): code = 404
 class LimitReached(RequestException): code = 403
@@ -110,7 +111,7 @@ def dictify(obj, attr_names:str):
     return dict(((a,getattr(obj,a)) for a in attr_names))
 
 def count_filesystem_allocation(use_cached):
-    # note: this function is fs only and does not include include db usage
+    # note: this function counts fs only and does not include include db usage
     this = count_filesystem_allocation
     if use_cached and hasattr(this, "cached"):
         return this.cached
@@ -119,9 +120,9 @@ def count_filesystem_allocation(use_cached):
     except:
         f_bsize = 4096 # if statvfs isn't available just guess a common value
     to_fs_size = lambda sz: ((sz-1) | (f_bsize-1)) + 1
-    spool_sizes_q = db.session.query(Spool.block_size, Spool.block_count)
-    r = this.cached = sum(to_fs_size(sz*cnt) for sz,cnt in spool_sizes_q.all())
-    return r
+    spool_sizes = db.session.query(Spool.block_size, Spool.block_count).all()
+    this.cached = sum(to_fs_size(sz*cnt) for sz,cnt in spool_sizes if sz)
+    return this.cached
 
 def reqd_kb_blocks(*f_sizes): return sum((sz - 1) // 1024 + 1 for sz in sizes)
 
@@ -155,7 +156,7 @@ def SPOOL_NEW(block_size, block_count, annotation):
     if db.session.query(Spool).count() >= Config()['max_spools']:
         raise LimitReached("Maximum number of spools reached.")
     requested_storage = storage_usage_kb() + reqd_kb_blocks(spool_size + 64)
-    if requested_storage > Config()['storage_quota_kb']
+    if requested_storage > Config()['storage_quota_kb']:
         raise LimitReached("Storage quota reached.")
 
     spool = Spool(block_size=block_size, block_count=block_count,
@@ -184,15 +185,12 @@ def ACCESS_INFO(k):
 
 def ACCESS_INFO_UPDATE(k, info):
     db.session.query(SpoolAccessor).filter_by(k=k).delete()
-    conflict = db.session.query(Spool).get(info['spool_id']) is None
-    try:
-        if conflict:
-            raise Conflict("Attempted creating access for nonexistent spool.")
-    else:
-        a = SpoolAccessor(k=k, **info)
-        db.session.add(a)
-    finally:
+    if db.session.query(Spool).get(info['spool_id']) is None:
         db.session.commit()
+        raise Conflict("Attempted creating access for nonexistent spool.")
+    a = SpoolAccessor(k=k, **info)
+    db.session.add(a)
+    db.session.commit()
 
 def ACCESS_REVOKE(k):
     count = db.session.query(SpoolAccessor).filter_by(k=k).delete()

@@ -20,7 +20,7 @@ class Data:
         raise NotImplemented()
 
 class UInt(Data):
-    bits = 32
+    bits = 31
     @classmethod
     def validate(cls, v):
         return type(v) is int and v in range(2 ** cls.bits)
@@ -76,6 +76,12 @@ class ServInfo(Data):
                 return False
         return True
 
+class SpoolAnnotation(Data):
+    @staticmethod
+    def validate(v):
+        exp = r"^[ \w\-+=/,.!#:;]{0,32}$"
+        return type(v) is str and re.match(exp, v) is not None
+
 class Record(Data):
     @classmethod
     def validate(cls, v):
@@ -122,12 +128,6 @@ class SpoolAccessInfo(Record):
         can_append = Bool,
         can_truncate = Bool
     )
-
-class SpoolAnnotation(Data):
-    @staticmethod
-    def validate(v):
-        exp = r"^[ \w\-+=/,.!#:;]{0,32}$"
-        return type(v) is str and re.match(exp, v) is not None
 
 
 
