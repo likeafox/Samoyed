@@ -90,6 +90,21 @@ class Record(Data):
         if not cls.validate(v):
             raise TypeError("not a valid {} object".format(cls.__name__))
         return dict(zip(cls.fields, v))
+    @classmethod
+    def from_dict(cls, d, *, strict=False):
+        r = []
+        for k,t in cls.fields.items():
+            try:
+                v = d[k]
+                if not t.validate(v):
+                    raise Exception()
+            except:
+                txt = f"Cannot create valid {cls.__name__} from object."
+                raise TypeError(txt)
+            r.append(v)
+        if strict and (type(d) is not dict or d != cls.to_dict(r)):
+            raise TypeError("Object is not valid in strict mode.")
+        return r
 
 class SpoolMetadata(Record):
     fields = dict(
@@ -152,15 +167,17 @@ class SPOOL_LIST(Request):
     result = [ UInt ]
 
 class SPOOL_NEW(Request):
+    method = "POST"
     owner_only = True
     params = dict(
-        id = UInt,
         block_size = UInt,
         block_count = SafeULong,
         annotation = SpoolAnnotation
     )
+    result = UInt
 
 class SPOOL_DELETE(Request):
+    method = "POST"
     owner_only = True
     params = { 'id': UInt }
 
@@ -175,10 +192,12 @@ class ACCESS_INFO(Request):
     result = SpoolAccessInfo
 
 class ACCESS_INFO_UPDATE(Request):
+    method = "POST"
     owner_only = True
     params = { 'k': B64KeySized, 'info': SpoolAccessInfo }
 
 class ACCESS_REVOKE(Request):
+    method = "POST"
     owner_only = True
     params = { 'k': B64KeySized }
 
@@ -193,10 +212,12 @@ class DATA_READ(Request):
     result = B64
 
 class DATA_APPEND(Request):
+    method = "POST"
     file = True
     params = { 'k': B64KeySized, 'head_offset': SafeULong }
 
 class DATA_TRUNCATE(Request):
+    method = "POST"
     params = { 'k': B64KeySized, 'tail_offset': SafeULong }
 
 
@@ -210,7 +231,7 @@ def extract_args(param_definition, data):
             try:
                 v = data[name]
             except KeyError:
-                TypeError(name)
+                raise TypeError(name)
             if not datatype.validate(v):
                 raise ValueError(name)
             yield name,v

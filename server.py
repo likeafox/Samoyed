@@ -18,7 +18,7 @@ import protocol
 assert protocol.VERSION == "2r1"
 
 # constants
-spool_dir = "spools"
+def spool_file_path(id): return os.path.join("spools", str(id))
 db_path = "test.db"
 public_config_opts = ['max_block_and_data_op_size', 'max_spools',
     'max_spool_size', 'storage_quota_kb']
@@ -61,25 +61,30 @@ class Spool(db.Model):
     __tablename__ = "spools"
     id = Column(Integer(unsigned=True),
                 Sequence('spool_id_seq'), primary_key=True)
+    # starting to think representing spool dimentions in blocks in the database
+    # wasn't the best choice, because there's too much room for programmer error
+    # in conversion. I could convert everything to bytes except block_size in
+    # the db, and still be able to enforce block alignment and implement the
+    # API no problem
     block_size = Column(Integer(unsigned=True), nullable=False)
     block_count = Column(BIGINT(unsigned=True), nullable=False)
     head_offset = Column(BIGINT(unsigned=True), nullable=False)
     tail_offset = Column(BIGINT(unsigned=True), nullable=False)
-    annotation = Column(String(24), nullable=False)
-    spool_accessors = relationship("SpoolAccess", back_populates="spool")
+    annotation = Column(String(32), nullable=False)
+    accessors = relationship("SpoolAccessor", back_populates="spool")
     def __repr__(self):
         return f"<Spool {self.id}>"
 
-class SpoolAccess(db.Model):
+class SpoolAccessor(db.Model):
     __tablename__ = "spool_accessors"
     k = Column(String(24), primary_key=True)
     spool_id = Column(Integer(unsigned=True), ForeignKey('spool.id'))
     can_read = Column(Boolean, nullable=False)
     can_append = Column(Boolean, nullable=False)
     can_truncate = Column(Boolean, nullable=False)
-    spool = relationship("Spool", back_populates="spool_accessors")
+    spool = relationship("Spool", back_populates="accessors")
     def __repr__(self):
-        return f"<SpoolAccess ({self.id})>"
+        return f"<SpoolAccessor ({repr(self.k)})>"
 
 
 
@@ -110,23 +115,26 @@ def count_filesystem_allocation(use_cached):
     if use_cached and hasattr(this, "cached"):
         return this.cached
     try:
-        f_bsize = os.statvfs(app_root).f_bsize
+        f_bsize = os.statvfs(os.getcwd()).f_bsize
     except:
         f_bsize = 4096 # if statvfs isn't available just guess a common value
-    to_fs_size = lambda sz: (sz-1 | f_bsize-1) + 1
-    all_spool_sizes_q = db.session.query(Spool.block_size, Spool.block_count)
-    r = this.cached = sum(to_fs_size(sz*cnt) for sz,cnt in all_spool_sizes_q.all())
+    to_fs_size = lambda sz: ((sz-1) | (f_bsize-1)) + 1
+    spool_sizes_q = db.session.query(Spool.block_size, Spool.block_count)
+    r = this.cached = sum(to_fs_size(sz*cnt) for sz,cnt in spool_sizes_q.all())
     return r
+
+def reqd_kb_blocks(*f_sizes): return sum((sz - 1) // 1024 + 1 for sz in sizes)
 
 def storage_usage_kb(use_cached=False):
     if not os.path.exists(db_path):
         return 0
     usage = count_filesystem_allocation(use_cached) + os.path.getsize(db_path)
-    return (quota_usage + spool_size - 1) // 1024 + 1
+    return reqd_kb(quota_usage + spool_size)
 
-#def spool_query(**kwargs):
-#    dbks = [ getattr(FileAccess, n) for n in protocol.FileEntry.fields ]
-#    return db.session.query(*dbks).filter_by(**kwargs)
+def get_accessor(k):
+    r = db.session.query(SpoolAccessor).get(k)
+    if r is None:
+        raise NoResult("Access key didn't find anything.")
 
 
 
@@ -136,158 +144,174 @@ def SERV_INFO():
     return dict(((k, Config()[k]) for k in public_config_opts))
 
 def SPOOL_LIST():
-    return db.session.query(Spool.id).all()
+    return [x for (x,) in db.session.query(Spool.id).all()]
 
-def SPOOL_NEW(id, block_size, block_count, annotation):
+def SPOOL_NEW(block_size, block_count, annotation):
     if block_size > Config()['max_block_and_data_op_size']:
         raise Denied("block_size is too big.")
     spool_size = block_size * block_count
     if spool_size > Config()['max_spool_size']:
         raise Denied("Cannot create a spool that big.")
-    if Spool.query.filter_by(id=id).count() != 0:
-        raise Conflict("A spool with that id already exists.")
-    if storage_usage_kb() > Config()['storage_quota_kb']
-        raise Denied("Storage quota reached.")
+    if db.session.query(Spool).count() >= Config()['max_spools']:
+        raise LimitReached("Maximum number of spools reached.")
+    requested_storage = storage_usage_kb() + reqd_kb_blocks(spool_size + 64)
+    if requested_storage > Config()['storage_quota_kb']
+        raise LimitReached("Storage quota reached.")
 
-    raise NotImplemented()
-
-
-
-def GET_FILE_ENTRY(user_id, file_id):
-    return file_entry_query(
-        user_id=user_id, file_id=file_id, accepted=True).one()
-
-def GET_UNACCEPTED_FILE_LIST(user_id):
-    q = db.session.query(FileAccess.file_id).filter_by(
-            user_id=user_id, accepted=False)
-    return [x for (x,) in q.all()]
-
-def GET_FILE_META(user_id, file_id):
-    fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-    return dictify(fa.file, "nonce enc_meta")
-
-def GET_FILE_DATA(user_id, file_id, start_end):
-    start, end = start_end
-    if start is None: start = 0
-    fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-    fn = fa.file.uuid_name
-    import os.path
-    with open(os.path.join("files",fn), 'rb') as fh:
-        fh.seek(start)
-        if end is None:
-            d = fh.read()
-        else:
-            d = fh.read(end-start)
-    import base64
-    return base64.b64encode(d).decode()
-
-def GET_FILE_USERS(user_id, file_id):
-    q=db.session.query(User.name).filter(User.id==FileAccess.user_id)\
-                                 .filter(FileAccess.file_id==file_id)
-    r = [x for (x,) in q.all()]
-    return r
-
-def NEW_FILE_ACCESS(user_id, file_id, target_username, can_modify):
-    fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-    target_user_id = User.query.filter_by(name=target_username).value(User.id)
-    if fa.can_modify == False and can_modify == True:
-        raise Exception("you can't do that")
-    new_fa = FileAccess(file_id=file_id, user_id=target_user_id,
-                        can_modify=can_modify, accepted=False)
-    db.session.add(new_fa)
+    spool = Spool(block_size=block_size, block_count=block_count,
+                head_offset=0, tail_offset=0, annotation=annotation)
+    db.session.add(spool)
     db.session.commit()
+    return spool.id
 
-def MODIFY_FILE_ACCESS_KEYS(user_id, file_id, enc_file_key, hidden_fn):
-    fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-    fa.enc_file_key = enc_file_key
-    fa.hidden_fn = hidden_fn
-    fa.accepted = True
+def SPOOL_DELETE(id):
+    db.session.query(SpoolAccessor).filter_by(spool_id=id).delete()
+    count = db.session.query(Spool).filter_by(id=id).delete()
     db.session.commit()
+    if count == 0:
+        raise NoResult("That spool doesn't exist to delete.")
+    os.remove(spool_file_path(id))
 
-def NEW_FILE(user_id, nonce, enc_file_meta, enc_file_key, hidden_fn):
-    if File.query.count() >= Config()['max_files']:
-        raise Exception("too many files!~")
-    uuid_fn = uuid.uuid4().hex
-    f_path = os.path.join(save_path,uuid_fn)
-    request.files['file'].save(f_path)
+def ACCESS_LIST(spool_id):
+    if db.session.query(Spool).filter_by(id=spool_id).count() == 0:
+        raise NoResult("That spool doesn't exist.")
+    q = db.session.query(SpoolAccessor.k).filter_by(spool_id=id)
+    return [k for (k,) in q.all()]
+
+def ACCESS_INFO(k):
+    a = get_accessor(k)
+    return [a.spool_id, a.can_read, a.can_append, a.can_truncate]
+
+def ACCESS_INFO_UPDATE(k, info):
+    db.session.query(SpoolAccessor).filter_by(k=k).delete()
+    conflict = db.session.query(Spool).get(info['spool_id']) is None
     try:
-        file_size = os.path.getsize(f_path)
-        if file_size > Config()['max_file_size']:
-            raise Exception("file's to big man")
-        kb_size = ((file_size - 1) // 1024) + 1
-        from sqlalchemy.sql import func
-        x = db.session.query(func.sum(File.kb_size)).all()[0][0]
-        db_kb_size = x or 0
-        print(db_kb_size)
-        #db.session.query(func.sum(File.kb_size)).all()
-        if db_kb_size+kb_size > Config()['max_kb']:
-            raise Exception("Repo is full")
-        rev_seq = Seq.query.filter_by(id=REVISION_SEQ_ID).one()
-        rev_seq.v += 1
-        file = File(uuid_name=uuid_fn, nonce=nonce,
-                    enc_meta=enc_file_meta, kb_size=kb_size, rev=rev_seq.v)
-        db.session.add(file)
-        db.session.flush()
-        fa = FileAccess(user_id=user_id, file_id=file.id,
-                        enc_file_key=enc_file_key, hidden_fn=hidden_fn,
-                        can_modify=True, accepted=True)
-        db.session.add(fa)
-        db.session.commit()
-    except:
-        os.remove(f_path)
-        raise
-    return file.id
-
-def UPDATE_FILE(user_id, file_id, nonce, enc_file_meta):
-    fa = FileAccess.query.filter_by(user_id=user_id, file_id=file_id).one()
-    if not fa.can_modify or not fa.accepted:
-        raise Exception("You can't modify that file")
-    file = File.query.filter_by(id=file_id).one()
-
-    new_uuid_name = uuid.uuid4().hex
-    new_path = os.path.join(save_path, new_uuid_name)
-    request.files['file'].save(new_path)
-    file_size = os.path.getsize(new_path)
-    if file_size > Config()['max_file_size']:
-        raise Exception("Files't toooo big")
-    kb_size = ((file_size - 1) // 1024) + 1
-    from sqlalchemy.sql import func
-    db_kb_size = db.session.query(func.sum(File.kb_size)).scalar()
-    if db_kb_size+(kb_size-file.kb_size) > Config()['max_kb']:
-        raise Exception("Repo is full")
-    file.nonce = nonce
-    file.enc_meta = enc_file_meta
-    file.kb_size = kb_size
-    old_path = os.path.join(save_path, file.uuid_name)
-    file.uuid_name = new_uuid_name
-    rev_seq = Seq.query.filter_by(id=REVISION_SEQ_ID).one()
-    file.rev = rev_seq.v = rev_seq.v+1
-    os.remove(old_path)
-    db.session.commit()
-
-def UNLINK_FILE(user_id, file_id):
-    fa_q = FileAccess.query.filter_by(file_id=file_id,user_id=user_id)
-    fa = fa_q.one()
-    file = fa.file
-    if len(file.file_accessors) == 1:
-        os.remove(os.path.join(save_path,file.uuid_name))
-        File.query.filter_by(id=file_id).delete()
-    fa_q.delete()
-    db.session.commit()
-
-def GET_REVISION():
-    return Seq.query.filter_by(id=REVISION_SEQ_ID).value(Seq.v)
-
-def GET_NEW_REVISIONS(user_id, client_rev):
-    rev = Seq.query.filter_by(id=REVISION_SEQ_ID).value(Seq.v)
-    if client_rev == rev:
-        rl = []
+        if conflict:
+            raise Conflict("Attempted creating access for nonexistent spool.")
     else:
-        q = db.session.query(File.id, File.rev).filter(
-            File.rev > client_rev, File.id==FileAccess.file_id,
-            FileAccess.user_id==user_id, FileAccess.accepted==True)
-        rl = [ list(x) for x in q.all() ]
-    return {'server_rev':rev, 'rev_list':rl}
+        a = SpoolAccessor(k=k, **info)
+        db.session.add(a)
+    finally:
+        db.session.commit()
+
+def ACCESS_REVOKE(k):
+    count = db.session.query(SpoolAccessor).filter_by(k=k).delete()
+    db.session.commit()
+    if count == 0:
+        raise NoResult("Spool not found.")
+
+def METADATA_FETCH(k):
+    s = get_accessor(k).spool
+    return [s.block_size, s.block_count, s.head_offset, s.tail_offset,
+        s.annotation]
+
+def DATA_READ(k, start_offset, block_count):
+    a = get_accessor(k)
+    if not a.can_read:
+        raise Denied("Access denied")
+    constraints_valid = a.spool.tail_offset <= start_offset and \
+                        (start_offset + block_count) <= a.spool.head_offset
+    if not constraints_valid:
+        raise Conflict("Attempting to read outside of valid range.")
+    if block_count == 0:
+        return ""
+    read_size = block_count * a.spool.block_size
+    if read_size > Config()['max_block_and_data_op_size']:
+        raise Denied("Would read more than server allows in a single request.")
+
+    # here, pass essentially refers to the number of times the file has been
+    # overwritten. offset is the block offset in the file of course.
+    st_pass, st_offset = divmod(start_offset, a.spool.block_count)
+    ed_pass, ed_offset = divmod(start_offset + block_count - 1, a.spool.block_count)
+    ed_offset += 1
+    # byte positions in file:
+    st_pos = st_offset * a.spool.block_size
+    ed_pos = ed_offset * a.spool.block_size
+    with open(spool_file_path(a.spool_id), 'rb') as f:
+        if st_pass == end_pass:
+            f.seek(st_pos)
+            data = f.read(read_size)
+            assert len(data) == read_size
+        else:
+            # the read constraints start and end on different passes; we'll
+            # have to do two separate reads.
+            data = bytearray(read_size)
+            ct = f.readinto(memoryview(data)[read_size-ed_pos:])
+            # asserts because I can't tell from the documentation whether it's
+            # guaranteed to fill the buffer if we don't accidentally hit EOF
+            # and it doesn't throw an exception.
+            assert ct == ed_pos
+            f.seek(st_pos)
+            ct = f.readinto(memoryview(data)[:read_size-ed_pos])
+            assert ct == read_size - ed_pos
+    import base64
+    return base64.b64encode(data).decode()
+
+def DATA_APPEND(k, head_offset):
+    a = get_accessor(k)
+    if not a.can_write:
+        raise Denied("Access denied")
+    if head_offset != k.spool.head_offset:
+        raise Conflict("Incorrect head offset.")
+    stream = request.files['file'].stream
+
+    # this operation is so ugly...
+    def receive_file():
+        max_op = min(a.spool.block_size * a.spool.block_count,
+                    Config()['max_block_and_data_op_size'])
+        recvd_bytes = 0
+        while recvd_bytes <= max_op:
+            data = stream.read(max_op - recvd_bytes + 1)
+            if data is None:
+                # no more data is ready yet, so wait for upload to continue
+                import time
+                time.sleep(0.2)
+            else:
+                ct = len(data)
+                if ct == 0:
+                    #success! upload is finished
+                    break
+                else:
+                    #got data:
+                    recvd_bytes += ct
+                    yield from data
+        else:
+            raise Denied("Client tried to write more data than is allowed by "\
+                "the server in a single request.")
+        if (recvd_bytes % a.spool.block_size) != 0:
+            raise Denied("Data is not aligned to spool's block size.")
+
+    # the file is usable now, and proper size is assured
+    file_data = bytes(receive_file())
+    path = spool_file_path(a.spool_id)
+    if head_offset == 0: #file doesn't exist yet
+        with open(path, 'xb') as f:
+            f.write(file_data)
+    else:
+        with open(path, 'r+b') as f:
+            spool_size_bytes = a.spool.block_size * a.spool.block_count
+            head_bytepos = (head_offset % a.spool.block_count) * a.spool.block_size
+            writelen_1 = min(spool_size_bytes - head_bytepos, len(file_data))
+            f.seek(head_bytepos)
+            ct = f.write(file_data[:writelen_1])
+            assert ct == writelen_1
+            ct = f.write(file_data[:writelen_1])
+            writelen_2 = len(file_data) - writelen_1
+            assert ct == writelen_2
+
+    a.spool.head_offset += len(file_data)
+    a.spool.tail_offset = max(a.spool.tail_offset,
+        (a.spool.head_offset - a.spool.block_count))
+    db.session.commit()
+
+def DATA_TRUNCATE(k, tail_offset):
+    a = get_accessor(k)
+    if not a.can_truncate:
+        raise Denied("Access denied")
+    if not a.spool.tail_offset <= tail_offset <= a.spool.head_offset:
+        raise Conflict("Tail offset is out of range.")
+    a.spool.tail_offset = tail_offset
+    db.session.commit()
 
 # set handlers
 for n,o in globals().copy().items():
@@ -305,13 +329,8 @@ for n,o in globals().copy().items():
 def handle_request():
     try:
         #set up request type
-        if set(request.form) != {'access_key','req_type','params'}:
+        if set(request.form) != {'req_type','params'}:
             raise InvalidRequest("Malformed request.")
-        global_permissions = { Config()['get_access_key']:('GET',),
-                               Config()['post_access_key']:('GET','POST'),
-                               }.get(request.form['access_key'],())
-        if request.method not in global_permissions:
-            raise Denied("Unauthorized.")
         try:
             reqtype = protocol.request_types[request.form['req_type']]
         except KeyError:
@@ -327,14 +346,14 @@ def handle_request():
         except (json.JSONDecodeError, TypeError):
             raise InvalidRequest("Malformed request.")
 
-        #do auth
-        if reqtype.auth:
+        #do owner auth
+        if reqtype.owner_only:
             try:
-                cred = protocol.extract_args(reqtype.auth_params, raw_params)
-                User.query.filter_by(id=cred['user_id'],
-                                     key_hash=cred['key_hash']).one()
-            except (TypeError, ValueError, NoResultFound):
-                raise Denied("Invalid credentials.")
+                cred = protocol.extract_args(reqtype.owner_params, raw_params)
+                if cred['owner_key'] != Config()['owner_key']:
+                    raise ValueError()
+            except (TypeError, ValueError):
+                raise Denied("Invalid credentials")
 
         #set up & validate parameters
         try:
