@@ -2,7 +2,7 @@
 
 # Copyright: Jason Forbes
 
-VERSION = "2r1"
+VERSION = "2r2"
 
 # Require Python 3.7 or later
 import sys
@@ -115,7 +115,7 @@ class Record(Data):
 class SpoolMetadata(Record):
     fields = dict(
         block_size = UInt,
-        block_count = SafeULong,
+        size_bytes = SafeULong,
         head_offset = SafeULong,
         tail_offset = SafeULong,
         annotation = SpoolAnnotation
@@ -171,7 +171,7 @@ class SPOOL_NEW(Request):
     owner_only = True
     params = dict(
         block_size = UInt,
-        block_count = SafeULong,
+        size_bytes = SafeULong,
         annotation = SpoolAnnotation
     )
     result = UInt
@@ -208,7 +208,7 @@ class METADATA_FETCH(Request):
 class DATA_READ(Request):
     params = { 'k': B64KeySized,
         'start_offset': SafeULong,
-        'block_count': UInt }
+        'length': UInt }
     result = B64
 
 class DATA_APPEND(Request):
