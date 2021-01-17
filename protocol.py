@@ -2,7 +2,7 @@
 
 # Copyright: Jason Forbes
 
-VERSION = "2r2"
+VERSION = "2r3"
 
 # Require Python 3.7 or later
 import sys
@@ -82,6 +82,11 @@ class SpoolAnnotation(Data):
         exp = r"^[ \w\-+=/,.!#:;]{0,32}$"
         return type(v) is str and re.match(exp, v) is not None
 
+class OwnerKeyString(Data):
+    @staticmethod
+    def validate(v):
+        return type(v) is str and len(v) in range(141)
+
 class Record(Data):
     @classmethod
     def validate(cls, v):
@@ -140,7 +145,7 @@ class Request:
     result = None
     file = False
     owner_only = False
-    owner_params = { 'owner_key': B64KeySized }
+    owner_params = { 'owner_key': OwnerKeyString }
     @staticmethod
     def handler():
         raise NotImplemented()

@@ -7,7 +7,7 @@ USAGE_STRING = """server.py --- A Samoyed server
 usage: server.py [run]
 
 Before running, things require some setup. Run the python interactive
-interpreter and import this server module then consider the following
+interpreter and import this server module then perform the following
 steps:
 
 1. Create the server's configuration:
@@ -18,12 +18,12 @@ set to a sane default. The defaults shouldn't be assumed to be acceptable
 though. You should review all the options and in particular it's recommended
 that owner_key be set to a passphrase generated with a high amount of entropy.
 Any good password generator will do, and a procedure like this is also
-acceptible: ( https://www.eff.org/dice ).
+acceptible: https://www.eff.org/dice
 
 2. Initialize the database:
 >>> db.create_all()
 
-3. Ensure sure the spool file directory (defined in the config file) exists."""
+3. Ensure the spool file directory (defined in the config file) exists."""
 
 #external imports
 from flask import Flask, request
@@ -41,7 +41,7 @@ db = SQLAlchemy(app)
 app_root = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, app_root)
 import protocol
-assert protocol.VERSION == "2r2"
+assert protocol.VERSION == "2r3"
 
 
 
@@ -76,7 +76,7 @@ def calc_storage_usage():
     spool_count = len(file_sizes)
     usage = sum(estimate_size_on_disk(sz) for (sz,) in file_sizes)
     if app.config['SQLALCHEMY_DATABASE_URI'].startswith("sqlite:"):
-        usage += os.path.getsize(Config()['db_location'])
+        usage += os.path.getsize(config()['db_location'])
     else:
         usage += spool_count * 64
     return usage
@@ -120,11 +120,11 @@ class config():
     def create_default_file(self, filename=None):
         filename = filename or self.conf_filename
         with open(filename, 'x') as f:
-            json.dump(opt_defaults, f)
+            json.dump(self.opt_defaults, f, indent="  ")
         self.conf_filename = filename
 
     def get_public_opts(self):
-        return dict((k, self()[k]) for k in public_opt_defaults)
+        return dict((k, self()[k]) for k in self.public_opt_defaults)
 
 
 
@@ -157,7 +157,7 @@ class Spool(db.Model):
 class SpoolAccessor(db.Model):
     __tablename__ = "spool_accessors"
     k = Column(String(24), primary_key=True)
-    spool_id = Column(Integer, ForeignKey('spool.id'))
+    spool_id = Column(Integer, ForeignKey('spools.id'))
     can_read = Column(Boolean, nullable=False)
     can_append = Column(Boolean, nullable=False)
     can_truncate = Column(Boolean, nullable=False)
@@ -215,12 +215,12 @@ def SPOOL_DELETE(id):
     db.session.commit()
     if count == 0:
         raise NoResult("That spool doesn't exist to delete.")
-    os.remove(spool_file_path(id))
+    os.remove(Spool.file_dir(id))
 
 def ACCESS_LIST(spool_id):
     if db.session.query(Spool).filter_by(id=spool_id).count() == 0:
         raise NoResult("That spool doesn't exist.")
-    q = db.session.query(SpoolAccessor.k).filter_by(spool_id=id)
+    q = db.session.query(SpoolAccessor.k).filter_by(spool_id=spool_id)
     return [k for (k,) in q.all()]
 
 def ACCESS_INFO(k):
@@ -391,7 +391,7 @@ def handle_request():
         if reqtype.owner_only:
             try:
                 cred = protocol.extract_args(reqtype.owner_params, raw_params)
-                if cred['owner_key'] != Config()['owner_key']:
+                if cred['owner_key'] != config()['owner_key']:
                     raise ValueError()
             except (TypeError, ValueError):
                 raise Denied("Invalid credentials")
@@ -422,16 +422,21 @@ def handle_request():
 
 
 # Go!
+
+def init():
+    app.config['SQLALCHEMY_DATABASE_URI'] = \
+    config()['db_uri_scheme'] + config()['db_location']
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db.init_app(app)
+
 if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] == "run":
-        app.config['SQLALCHEMY_DATABASE_URI'] = \
-            config()['db_uri_scheme'] + config()['db_location']
-        app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-        db.init_app(app)
+        init()
         app.run(debug=True)
     else:
         print(USAGE_STRING)
 else:
     #os.chdir(app_root)
     #???
+    init()
     application = app
