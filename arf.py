@@ -10,6 +10,9 @@ from itertools import islice
 import collections.abc
 import io
 
+# local imports
+import selfdelimitedblob
+
 
 
 # Data defs
@@ -38,10 +41,13 @@ class DataDef:
         return v
 
 class UInt(DataDef):
+    @staticmethod
+    def bit_length_to_byte_length(bits):
+        assert bits > 0
+        return (bits - 1) // 8 + 1
     @classmethod
     def byte_length(cls):
-        assert cls.bit_length > 0
-        return (cls.bit_length - 1) // 8 + 1
+        return bit_length_to_byte_length(cls.bit_length)
     @classmethod
     def validate(cls, v):
         if type(v) is not int or v < 0 or v.bit_length() > cls.bit_length:
@@ -54,28 +60,51 @@ class UInt(DataDef):
         v = int.from_bytes(b, 'little')
         return v
 
-class UInt8(UInt):
-    bit_length = 8
-
-class UInt64(UInt):
-    bit_length = 64
-
-class UnitTypeID(UInt):
-    bit_length = 8
-    app_defined_range = range(128,256)
-
 class TxScopeID(UInt): # transaction-scope id
     bit_length = 16
+
+class StrandID(UInt):
+    bit_length = 64
+
+class StrandSize(UInt):
+    bit_length = 64
+
+class RangedUInt(UInt):
+    @classmethod
+    def byte_length(cls):
+        assert 0 <= cls.valid_range.start < cls.valid_range.stop
+        bits = (cls.valid_range.stop - 1).bit_length()
+        return UInt.bit_length_to_byte_length(bits)
+    @classmethod
+    def validate(cls, v):
+        if v not in cls.valid_range:
+            raise TypeError()
+
+class ByteInt(RangedUInt):
+    valid_range = range(0,256)
+    @staticmethod
+    def byte_length():
+        assert valid_range.stop <= 256
+        return 1
+    @classmethod
+    def _unsafe_pack(cls, v):
+        return bytes((v,))
+    @classmethod
+    def _unsafe_unpack(cls, b):
+        return b[0]
+
+class UnitTypeID(ByteInt):
+    deleted_range = range(0, 2)
+    arf_base_defined_range = range(2, 128)
+    app_defined_range = range(128,256)
+
+class StrandGroupMagnitude(ByteInt):
+    valid_range = range(1, StrandID.bit_length)
     @classmethod
     def to_strand_group_mask(cls, v):
         return -1 << v
 
-class StrandID(UInt64): pass
-
-class Bool(DataDef):
-    @classmethod
-    def byte_length():
-        return 1
+class Bool(ByteInt):
     @classmethod
     def validate(cls, v):
         if type(v) is not bool:
@@ -102,15 +131,16 @@ class ByteData(DataDef):
         return b
 
 class StrandData(ByteData):
-    block_size_bytes = 512
     @classmethod
     def byte_length(cls):
-        return 'variable'
+        return StrandDataLength
     @classmethod
     def validate(cls, v):
         ByteData.validate(v)
-        if len(v) not in range(1, cls.block_size_bytes + 1):
-            return TypeError()
+        cls.byte_length().validate(len(v))
+
+class StrandDataLength(RangedUInt):
+    valid_range = (1, 512 + 1)
 
 
 
@@ -143,18 +173,11 @@ class unit_metaclass(type):
         new_cls = super(unit_metaclass, cls).__new__(cls, name, bases, attrs)
         return new_cls
 
-class UnitFormatError(ValueError): pass
+class UnitDataFormatError(ValueError): pass
 
-def read_exact_or_fail(stream, sz):
-    r = stream.read(sz)
-    assert len(r) == sz
-    return r
-
-class Unit(metaclass=unit_metaclass):
-    additional_data_defs = {'typeid':UnitTypeID}
-
+class UnitBase(metaclass=unit_metaclass):
     @classmethod
-    def _key_to_piece_index(cls, key):
+    def key_to_piece_index(cls, key):
         if type(key) is int:
             return key
         if type(key) is str:
@@ -163,82 +186,57 @@ class Unit(metaclass=unit_metaclass):
             return self.data_spec.index(key)
         raise TypeError()
 
-    @property
-    def roles():
-        raise NotImplementedError()
+    def __init__(self, *pieces):
+        if len(pieces) != len(self.data_spec):
+            raise UnitDataFormatError("Wrong number of pieces")
+        self.pieces = pieces
+        self.__class__._validate(self)
 
     @classmethod
-    def calc_piece_slices_in_buf(cls, buffer):
-        r = []
-        pos = 0
-        for dd in cls.data_spec:
-            len_spec = dd.byte_length()
-            if type(len_spec) is int and len_spec >= 0:
-                l = len_spec
-            elif len_spec == "variable":
-                l = int.from_bytes(buffer[pos:pos+2], 'little')
-                pos += 2
-            else:
-                raise TypeError("Invalid byte length spec")
-            r.append(slice(pos, pos + l))
-            pos += l
-        if pos > len(buffer):
-            raise UnitFormatError("Would read past end of buffer")
-        return r
-
-    @staticmethod
-    def actual_byte_length_from_slices(slices):
-        try:
-            return slices[-1].stop
-        except IndexError:
-            return 0
-
-    def __init__(self, *pieces):
-        if len(pieces) != len(self.data_defs):
-            raise UnitFormatError("Wrong number of pieces")
-        validate_pcs = (dd.validate(p) for dd,p in zip(self.data_spec, pieces))
-        collections.deque(validate_pcs,maxlen=0) # exhaust generator
-        self.pieces = pieces
+    def _validate(cls, v):
+        if not type(v) is cls:
+            raise TypeError()
+        for dt,pn,p in zip(self.data_spec, self.piece_names, pieces):
+            try: dt.validate(p)
+            except TypeError: raise UnitDataFormatError(f"failed validation of {pn}")
 
     def __getitem__(self, key):
-        return self.pieces[self._key_to_piece_index(key)]
+        return self.pieces[self.key_to_piece_index(key)]
 
     def __repr__(self):
-        return f"<{self.__class__.__name__} {id(self)} {tuple(self.pieces)}>"
+        pcs = repr(tuple(self.pieces))
+        return f"<{self.__class__.__name__} {id(self)}" \
+               f" {pcs[:50]+(pcs[50:] or ' ...')}>"
 
-    def pack(self):
-        def gen():
-            for dd,p in zip(self.data_spec, self.pieces):
-                packed = dd.pack(p)
-                if dd.byte_length() == "variable":
-                    yield from len(packed).to_bytes(2, 'little')
-                yield from packed
-        return bytes(gen())
+class Unit(UnitBase):
+    additional_data_defs = {'typeid':UnitTypeID}
 
-    @classmethod
-    def unpack(cls, packed):
-        slices = calc_piece_slices_in_buf(packed)
-        if len(packed) != cls.actual_byte_length_from_slices(slices):
-            raise UnitFormatError("Packed data is longer than spec")
-        pieces = (dd.unpack(packed[s]) for dd,s in zip(cls.data_spec, slices))
-        return cls(*pieces)
 
-class UnitTypeIndexer:
+
+# ARF
+
+class ARFSpec():
     def __init__(self, inherit=None):
         self._list = {} if inherit is None else inherit._list.copy()
 
     def __getitem__(self, key):
         return self._list[key]
 
+    def __contains__(self, key):
+        return key in self._list or \
+               (issubclass(key, Unit) and key in self._list.values())
+
     def register(self, id):
         UnitTypeID.validate(id)
         if id in self._list:
             raise ValueError("Unit type already registered")
         def d(c):
-            if not c.__module__ == __name__ and \
-               id not in UnitTypeID.app_defined_range:
-                raise ValueError("Unit Type ID out of acceptable range")
-            c.unit_type_id = id
+            assert issubclass(c, Unit)
+            ok_range = UnitTypeID.arf_base_defined_range if \
+                (c.__module__ == __name__) else UnitTypeID.app_defined_range
+            if id not in ok_range:
+                raise ValueError("Unit Type ID out of acceptable range " \
+                                f"{ok_range.start}..{ok_range.stop-1}")
             self._list[id] = c
             return c
         return d
@@ -246,67 +244,54 @@ class UnitTypeIndexer:
     def __repr__(self):
         return f"<{self.__class__.__name__} {id(self)} ({self._list})>"
 
-    def read_unit_in_stream(self, stream, *get_pieces, complete=True):
-        """Assuming stream cursor is at the start of a byte-encoded Unit,
-        read the unit pieces specified in get_pieces, and then return a
-        list of their values. It's possible to only pass `stream` to this
-        function which is useful if the only thing you want to do is
-        seek past the Unit (probably in order to read a subsequent Unit).
-        If `complete` is set to True, the function will always return
-        with the stream cursor at the end of the Unit. If `complete` is
-        set to False, the function will exit as soon as all the sought
-        pieces have been retrieved."""
-        raise NotImplementedError()
-
-    def stat_unit_in_buf(self, buffer, offset=0):
-        "Get the type id and length of a Unit in buffer at specified offset"
-        if offset != 0:
-            buffer = memoryview(buffer)[offset:]
-        type_id = UnitTypeID.unpack(buffer[:UnitTypeID.byte_length()])
-        slices = self[type_id].calc_piece_slices_in_buf(buffer)
-        length = Unit.actual_byte_length_from_slices(slices)
-        return type_id, length
-
-base = UnitTypeIndexer()
+base = ARFSpec()
 
 # Built-in Unit types
 
-@base.register(1)
+@base.register(2)
 class TxScopeMarker(Unit):
     additional_data_defs = {'prev-txs': TxScopeID, 'next-txs': TxScopeID}
     roles = {'relationship:': 'SCOPE-CONTROLLER',
              'scope': 'GLOBAL',
              'persistence': 'ELAPSING'}
 
-@base.register(2)
+@base.register(3)
 class TxScopeFinalize(Unit):
     additional_data_defs = {'commit-or-release': Bool}
     roles = {'relationship': 'MODIFIER',
              'scope': 'TX',
              'persistence': 'ELAPSING'}
 
-@base.register(3)
+@base.register(4)
 class StrandSelect(Unit):
-    additional_data_defs = {'strand-id': UInt64}
+    additional_data_defs = {'strand-id': StrandID}
     roles = {'relationship': 'MODIFIER',
              'scope': 'TX',
              'persistence': 'REFRESHING'}
 
-@base.register(4)
-class StrandWriteDataBlock(Unit):
-    additional_data_defs = {'offset': UInt64, 'data': StrandData}
-    roles = {'relationship': 'OBJECT',
-             'scope': 'TX',
-             'persistence': 'REFRESHING'}
-
 @base.register(5)
-class StrandCreateUpdate(Unit):
-    additional_data_defs = {'strd-size-bytes': UInt64}
-    roles = {'relationship': 'OBJECT',
+class StrandGroupSelect(Unit):
+    additional_data_defs = {'strand-group': StrandID,
+                            'strand-group-mag': StrandGroupMagnitude}
+    roles = {'relationship': 'MODIFIER',
              'scope': 'TX',
              'persistence': 'REFRESHING'}
 
 @base.register(6)
+class StrandWriteDataBlock(Unit):
+    additional_data_defs = {'offset': StrandSize, 'data': StrandData}
+    roles = {'relationship': 'OBJECT',
+             'scope': 'TX',
+             'persistence': 'REFRESHING'}
+
+@base.register(7)
+class StrandCreateUpdate(Unit):
+    additional_data_defs = {'strd-size-bytes': StrandSize}
+    roles = {'relationship': 'OBJECT',
+             'scope': 'TX',
+             'persistence': 'REFRESHING'}
+
+@base.register(8)
 class StrandDiscard(Unit):
     additional_data_defs = {'strd-group-member-sub-id-sz-bits': UnitTypeID}
     roles = {'relationship':'OBJECT',
@@ -315,49 +300,106 @@ class StrandDiscard(Unit):
 
 
 
-# Defaults, Local Cache
+# IO
 
-class LocalCache: pass
+class ARFIOWrapper(selfdelimitedblob.IO):
+    def __init__(self, spec:ARFSpec, stream:io.BufferedIOBase=None):
+        super().__init__(stream)
+        self.spec = spec
+        assert list(Unit.data_spec) == [UnitTypeID] #required constraint for deletion functionality
 
-class MemoryOnlyLocalCache:
-    def __init__(self, name, est_size, est_msg_size, **options):
-        self.reset()
+    # read/load interface
 
-    def append(self, unit):
-        if type(unit) not in (bytes, bytearray):
-            raise TypeError()
-        self.ctr += 1
-        self.cache[self.ctr] = unit
-        return self.ctr
+    def _get_next_piece_length(self, datatype):
+        len_spec = datatype.byte_length()
+        if type(len_spec) is int and len_spec >= 0:
+            return len_spec
+        if issubclass(len_spec, UInt):
+            return self._read_data(len_spec)
+        else:
+            raise TypeError("Invalid byte length spec")
 
-    def discard(self, id):
-        if id not in self.cache:
-            raise ValueError()
-        del self.cache[id]
+    def _read_data(self, datatype):
+        sz = self._get_next_piece_length(datatype)
+        data = self.stream.read(sz)
+        if len(data) != sz:
+            raise UnitDataFormatError("reading past end of buffer")
+        return datatype.unpack(data)
 
-    def discard_all_before(self, id):
-        return dict((k,v) for k,v in self.cache.items() if k >= id)
+    def read_next(self, opt=None):
+        """Read data from the unit next in stream. If the unit has been
+        deleted, return None. Otherwise, the default behaviour is to return
+        the data as a new Unit instance. Optionally, opt can be a list of
+        unit pieces to read, in which case a list of the resulting pieces is
+        returned. Only data that is requested is read so if an empty list is
+        provided, the function will prerform only the minimal reads necessary
+        to seek to the end of the unit in stream."""
+        unit_pcs = [self._read_data(dt) for dt in Unit.data_spec]
+        unit_typeid = unit_pcs[Unit.key_to_piece_index('typeid')]
 
-    def get(self, id, callback):
-        return self.cache[id]
-        # if id not in self.cache:
-        #     raise KeyError()
+        if unit_typeid in UnitTypeID.deleted_range:
+            if unit_typeid == 1:
+                while self._read_data(Bool):
+                    pass # skip to end of deleted unit
+            return None
 
-    def reset(self):
-        self.ctr = 0 # first id will be 1
-        self.cache = {}
+        unit_type = self.spec[unit_typeid]
+        if opt is None:
+            choice_indices = range(len(unit_type.data_spec))
+        else:
+            choice_indices = [unit_type.key_to_piece_index(k) for k in opts]
+            assert len(choice_indices) == len(set(choice_indices))
 
-    def __iter__(self):
-        #dict items are iterated in insertion order in py 3.7
-        yield from self.cache.items()
+        for i,dt in islice(enumerate(unit_type.data_spec), start=len(unit_pcs)):
+            if i in choice_indices:
+                p = self._read_data(dt)
+            else:
+                self.stream.seek(self._get_next_piece_length(dt),1)
+                p = None
+            unit_pcs.append(p)
 
-class DefaultLocalCache(LocalCache):
-    def __init__(self, name, est_size, est_msg_size, **options):
-        assert path in options
-        raise NotImplementedError()
-        #self.max_items = options.get('max_items', None)
-        #if self.max_items is not None and len(self.cache) > self.max_items:
-        #    del self.cache[next(iter(self.cache))]
+        if opt is None:
+            return unit_type(*unit_pcs) # unit instance by default
+        return [unit_pcs[i] for i in opt] # optionally, pick specific pieces
+
+    # skip interface
+
+    def skip_next(self):
+        return None if (self._read_next([]) is None) else True
+
+    # write interface
+
+    def _write_data(self, data, datatype):
+        packed = datatype.pack(data)
+        len_spec = datatype.byte_length()
+        if type(len_spec) is int:
+            assert len(packed) == len_spec
+        else:
+            self._write_data(len(packed), len_spec)
+        self.stream.write(packed) #dw, io.BufferedIOBase.write always writes everything
+
+    def write_unit(self, unit):
+        for dt,p in zip(unit.data_spec, unit.pieces):
+            self._write_data(p, dt)
+
+    def write_obj(self, obj):
+        return self.write_unit(obj)
+
+    # delete interface
+
+    def delete_next(self):
+        start_pos = self.stream.tell()
+        if self.skip_next() is None:
+            return
+        sz = self.stream.tell() - start_pos
+        self.stream.seek(start_pos, 0)
+        id_sz = UnitTypeID.byte_length()
+        if sz == id_sz:
+            self._write_data(0, UnitTypeID)
+        else:
+            self._write_data(1, UnitTypeID)
+            self.stream.write(b'\x01' * (sz - id_sz - 1))
+            self.stream.write(b'\0')
 
 
 
