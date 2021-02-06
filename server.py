@@ -86,7 +86,7 @@ def calc_storage_usage():
 # Config loader
 
 @call
-class config():
+class config:
     default_filename = "conf.json"
     public_opt_defaults = {
         'max_block_and_data_op_size': 1024**2,

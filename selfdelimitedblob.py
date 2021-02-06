@@ -3,23 +3,21 @@ __all__ = ["IO","SequentialStorage","MemoryOnlyStorage"]
 import io
 
 class IO:
-    def __init__(self, stream:io.BufferedIOBase=None):
-        if stream is None:
-            self.stream = io.BytesIO()
-        elif not isinstance(stream, io.BufferedIOBase):
+    def __init__(self, stream:io.BufferedIOBase):
+        if not isinstance(stream, io.BufferedIOBase):
             raise TypeError("need BufferedIOBase")
-        else:
-            self.stream = stream
+        self.stream = stream
         assert stream.isatty() is False and stream.seekable() is True
 
     @staticmethod
-    def read_next(opt=None):
+    def read_next(**opts):
         """Read and/or seek through the next blob in the stream, to produce an
         appropriate return value. Return non-None if blob exists, or None if it
-        is deleted. The application can optionally provide opt to control how
-        the function should read or interpret the blob. It is expected that
-        the default behaviour is to simply read the entire blob and return
-        it verbatim, or a translation to its associated object."""
+        is deleted. The application can optionally provide arbitrary keyword
+        arguments to control how the function should read or interpret the
+        blob. It is expected that the default behaviour is to simply read the
+        entire blob and either return it verbatim, or a translation to its
+        associated object."""
         raise NotImplementedError()
     @staticmethod
     def skip_next():
@@ -43,55 +41,55 @@ class SequentialStorage:
     pass
 
 class MemoryOnlyStorage(SequentialStorage):
-    def __init__(self, name, sdb_skip_func, est_store_size, max_sdb_size, **options):
+    def __init__(self, name:str, io_interface, **options):
+        self.name = name
+        self.io_interface = io_interface
+        self._closed = False
         self.reset()
 
-    def close(self):
-        pass
+    def test_closed(self):
+        if self._closed:
+            raise RuntimeError("Storage is closed and can't perform any operation")
 
-    def append(self, blob):
-        if type(blob) not in (bytes, bytearray):
-            raise TypeError()
-        self.ctr += 1
-        self.store[self.ctr] = blob
-        return self.ctr
+    @property
+    def store(self):
+        self.test_closed()
+        return self._store
+
+    @store.setter
+    def store(self, value):
+        self.test_closed()
+        self._store = value
+
+    def reset(self):
+        self.test_closed()
+        self.id_ctr = 0 # first id will be 1
+        self.store = {}
+
+    def append(self, obj):
+        self.id_ctr += 1
+        s = io.BytesIO()
+        self.io_interface(s).write_obj(obj)
+        self.store[self.id_ctr] = s.getvalue()
+        return self.id_ctr
+
+    def read(self, id, **opts):
+        s = io.BytesIO(self.store[id])
+        return self.io_interface(s).read_next(**opts)
+
+    def multi_read_iter(self, start_id=0, end_id=float('inf'), **opts):
+        ids = (k for k in self.store.keys() if (start_id <= k < end_id))
+        for id in ids:
+            r = self.read(id, opts=opts)
+            if r is not None:
+                yield (id, r)
 
     def discard(self, id):
-        if id not in self.store:
-            raise ValueError()
         del self.store[id]
 
     def discard_all_before(self, id):
-        return dict((k,v) for k,v in self.store.items() if k >= id)
+        self.store = dict((k,v) for k,v in self.store.items() if k >= id)
 
-    def get_stream_for(self, id):
-        return self.store[id]
-        # if id not in self.store:
-        #     raise KeyError()
-
-    def reset(self):
-        self.ctr = 0 # first id will be 1
-        self.store = {}
-
-    def read_ctx(self, start_id=0):
-        it_obj = self._it()
-        #dict items are iterated in insertion order in py 3.7
-        it_obj.store_iter = iter(self.store.items())
-        return it_obj
-
-    class _it:
-        def __iter__(self):
-            return self
-        def __next__(self):
-            r, self.cur_item = next(self.cache_iter)
-            return r
-        def get_stream_for_cur_item(self):
-            return io.BytesIO(self.cur_item)
-
-# class DefaultLocalCache(LocalCache):
-#     def __init__(self, name, est_size, est_msg_size, **options):
-#         assert path in options
-#         raise NotImplementedError()
-        #self.max_items = options.get('max_items', None)
-        #if self.max_items is not None and len(self.cache) > self.max_items:
-        #    del self.cache[next(iter(self.cache))]
+    def close(self):
+        del self._store
+        self._closed = True

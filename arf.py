@@ -222,6 +222,16 @@ class ARFSpec():
     def __getitem__(self, key):
         return self._list[key]
 
+    def reverse_lookup(self, datatype):
+        if isinstance(datatype, Unit):
+            datatype = datatype.__class__
+        elif not issubclass(datatype, Unit):
+            raise TypeError()
+        for k,v in self._list:
+            if v is datatype:
+                return k
+        raise LookupError()
+
     def __contains__(self, key):
         return key in self._list or \
                (issubclass(key, Unit) and key in self._list.values())
@@ -257,22 +267,22 @@ class TxScopeMarker(Unit):
 
 @base.register(3)
 class TxScopeFinalize(Unit):
-    additional_data_defs = {'commit-or-release': Bool}
+    additional_data_defs = {'release-or-commit': Bool}
     roles = {'relationship': 'MODIFIER',
              'scope': 'TX',
              'persistence': 'ELAPSING'}
 
 @base.register(4)
 class StrandSelect(Unit):
-    additional_data_defs = {'strand-id': StrandID}
+    additional_data_defs = {'strd-id': StrandID}
     roles = {'relationship': 'MODIFIER',
              'scope': 'TX',
              'persistence': 'REFRESHING'}
 
 @base.register(5)
 class StrandGroupSelect(Unit):
-    additional_data_defs = {'strand-group': StrandID,
-                            'strand-group-mag': StrandGroupMagnitude}
+    additional_data_defs = {'strd-group': StrandID,
+                            'strd-group-mag': StrandGroupMagnitude}
     roles = {'relationship': 'MODIFIER',
              'scope': 'TX',
              'persistence': 'REFRESHING'}
@@ -303,7 +313,7 @@ class StrandDiscard(Unit):
 # IO
 
 class ARFIOWrapper(selfdelimitedblob.IO):
-    def __init__(self, spec:ARFSpec, stream:io.BufferedIOBase=None):
+    def __init__(self, stream:io.BufferedIOBase, spec:ARFSpec):
         super().__init__(stream)
         self.spec = spec
         assert list(Unit.data_spec) == [UnitTypeID] #required constraint for deletion functionality
@@ -326,10 +336,10 @@ class ARFIOWrapper(selfdelimitedblob.IO):
             raise UnitDataFormatError("reading past end of buffer")
         return datatype.unpack(data)
 
-    def read_next(self, opt=None):
+    def read_next(self, select=None):
         """Read data from the unit next in stream. If the unit has been
         deleted, return None. Otherwise, the default behaviour is to return
-        the data as a new Unit instance. Optionally, opt can be a list of
+        the data as a new Unit instance. Optionally, `select` can be a list of
         unit pieces to read, in which case a list of the resulting pieces is
         returned. Only data that is requested is read so if an empty list is
         provided, the function will prerform only the minimal reads necessary
@@ -344,10 +354,10 @@ class ARFIOWrapper(selfdelimitedblob.IO):
             return None
 
         unit_type = self.spec[unit_typeid]
-        if opt is None:
+        if select is None:
             choice_indices = range(len(unit_type.data_spec))
         else:
-            choice_indices = [unit_type.key_to_piece_index(k) for k in opts]
+            choice_indices = [unit_type.key_to_piece_index(k) for k in select]
             assert len(choice_indices) == len(set(choice_indices))
 
         for i,dt in islice(enumerate(unit_type.data_spec), start=len(unit_pcs)):
@@ -358,9 +368,9 @@ class ARFIOWrapper(selfdelimitedblob.IO):
                 p = None
             unit_pcs.append(p)
 
-        if opt is None:
+        if select is None:
             return unit_type(*unit_pcs) # unit instance by default
-        return [unit_pcs[i] for i in opt] # optionally, pick specific pieces
+        return [unit_pcs[i] for i in select] # optionally, pick specific pieces
 
     # skip interface
 
@@ -398,6 +408,7 @@ class ARFIOWrapper(selfdelimitedblob.IO):
             self._write_data(0, UnitTypeID)
         else:
             self._write_data(1, UnitTypeID)
+            #these bytes will be read as Bools:
             self.stream.write(b'\x01' * (sz - id_sz - 1))
             self.stream.write(b'\0')
 
@@ -405,18 +416,20 @@ class ARFIOWrapper(selfdelimitedblob.IO):
 
 # Mappings
 
-# class UnitMapInfo:
-#     def __init__(self, cached_id):
-#         self.cached_id = cached_id
+class ARFMap:
+    class UnitInfo:
+        def __init__(self, cached_id):
+            self.cached_id = cached_id
 
-# class ARFMap:
-#     def __init__(self, unit_type_listing, *includes):
-#         self.cur_txscope = None
-#         self.pre_mapping_content = []
-#         self.unit_type_listing = unit_type_listing
-#         #self.unit_types
+    def __init__(self, unit_type_listing, *includes):
+        self.initial_txscope = None
+        self.cur_txscope = None
+        self.last_sync_id = -1
+        self.unit_type_listing = unit_type_listing
+        #self.unit_types
 
-#     def include()
+    def sync():
+        pass
 
 
 
