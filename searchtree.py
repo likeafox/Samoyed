@@ -1,15 +1,104 @@
 # copyright (c) 2021 Jason Forbes
 
-import random, itertools, collections
+import random, itertools, operator
+from collections import deque, namedtuple
+
+
 
 class Node:
-    __slots__ = ('children','k','v')
-    def __init__(self, k, v=None):
+    __slots__ = ('children','k')
+    def __init__(self, k):
         self.children = [None, None]
         self.k = k
-        if v is not None:
-            self.v = v
-    
+
+    def __repr__(self):
+        cks = [getattr(c,'k',None) for c in self.children]
+        return f"<{__name__}.{self.__class__.__name__} ({self.k}) {cks}>"
+
+
+
+# global consts
+directions = namedtuple('DirectionEnum',"left right")(0,1)
+limits = [object(),object()]
+
+
+
+class Cursor:
+    __slots__ = ('iter_direction', 'path_nodes', 'has_result', 'is_closed')
+    def __init__(self, root:Node, iter_direction=directions.right, stack=None):
+        self.iter_direction = iter_direction
+        self.path_nodes = stack if (stack is not None) else deque()
+        self.path_nodes.append(root)
+        self.has_result = root is not None
+        self.is_closed = root is None
+
+    def close(self):
+        self.is_closed = True
+
+    def __bool__(self):
+        return self.has_result
+
+    @property
+    def node(self):
+        return self.path_nodes[-1] if self.has_result else None
+
+    def find(self, k):
+        if self.is_closed:
+            self.has_result = False
+            return self
+
+        if k not in limits: #find specific Node(k)
+            n = self.path_nodes[-1]
+            while n.k != k:
+                n = n.children[int(n.k < k)]
+                if n is None:
+                    break
+                self.path_nodes.append(n)
+            self.has_result = n is not None
+        else: #go to limit
+            course = limits.index(k)
+            n = self.path_nodes[-1].children[course]
+            while n is not None:
+                self.path_nodes.append(n)
+                n = n.children[course]
+            self.has_result = True
+        return self
+
+    def reverse(self):
+        self.iter_direction ^= 1
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.is_closed:
+            self.has_result = False
+            raise StopIteration()
+        def node(): return self.path_nodes[-1]
+
+        course = self.iter_direction
+        while True:
+            # move
+            if not course & -2: #then course is pointing downward
+                next_ = node().children[course]
+                if next_ is not None: #then node is valid; go
+                    self.path_nodes.append(next_)
+                    course = [2,-1][self.iter_direction]
+            else: #upward course
+                prev = self.path_nodes.pop()
+                try:
+                    course = node().children.index(prev)
+                except IndexError:
+                    self.close()
+                    raise StopIteration()
+            # pivot
+            course += (self.iter_direction << 1) - 1
+            if course == self.iter_direction:
+                self.has_result = True
+                return node().k
+
+
+
 class SearchTree:
     class AnchorK:
         def __lt__(self, other):
@@ -19,27 +108,9 @@ class SearchTree:
         self.size = 0
         self.anchor = Node(self.AnchorK())
 
-    def lookup_node_and_parents(self, k, maxlen=None, anchor=False):
-        """Return a deque of a node (specified by k) and its ancestors, with
-        order starting closest to root and ending with Node(k). If k is not
-        found, then the last element in the deque will be None, and the others
-        will be the nodes tested before the search exhausted. `maxlen`
-        describes the size of the deque returned, which can be None or an int
-        greater than zero. To enable returning the tree's anchor node set
-        `anchor` to True, but be warned that the tree's anchor node does not
-        have a valid k value."""
-        #             anchor:      root:
-        init_nodes = [self.anchor, self.anchor.children[1]][int(not anchor):]
-        nodes = collections.deque(init_nodes, maxlen)
-        while True:
-            n = nodes[-1]
-            if n is None or n.k == k:
-                return nodes
-            nodes.append(n.children[int(n.k < k)])
-        return nodes
-
-    def insert(self, k, v=None):
-        new_node = Node(k, v)
+    def insert(self, node_or_k):
+        new_node = node_or_k if isinstance(node_or_k,Node) else Node(node_or_k)
+        k = new_node.k
         drop_depth = random.getrandbits(self.size.bit_length()).bit_length() if self.size else 0
         node = self.anchor
         for depth in itertools.count():
@@ -72,52 +143,49 @@ class SearchTree:
         self.size += 1
 
     def delete(self, k):
-        raise NotImplementedError("still bugged, will fix later")
-        del_node_parent, del_node = self.lookup_node_and_parents(k,2,anchor=True)
-        if del_node is None:
+        find_del = Cursor(self.anchor, stack=deque(maxlen=2)).find(k)
+        if not find_del:
             raise LookupError(k)
+        del_node_parent, del_node = find_del.path_nodes
         del_course = del_node_parent.children.index(del_node)
         del_children = [n for n in del_node.children if n is not None]
         if len(del_children) == 2:
             #find a suitable replacement node
             course = random.getrandbits(1)
             init_search_nodes = (del_node, del_children[course^1])
-            nodes = collections.deque(init_search_nodes, maxlen=3)
+            nodes = deque(init_search_nodes, maxlen=3)
             while nodes[-1] is not None:
                 nodes.append(nodes[-1].children[course])
             replacement_node = nodes[1]
 
-            nodes[0].children[course] = replacement_node.children[course^1] #detach replacement node
-            replacement_node.children = del_children
-            if del_children[course^1] is replacement_node:
-                replacement_node.children[course^1] = None
+            nodes[0].children[course ^ (nodes[0] is del_node)] = \
+                replacement_node.children[course^1] #detach replacement node
+            replacement_node.children = del_node.children
         else:
             replacement_node = del_children[0] if len(del_children) == 1 else None
         del_node_parent.children[del_course] = replacement_node
         self.size -= 1
 
     def __contains__(self, k):
-        return self.lookup_node_and_parents(k, 1)[0] is not None
+        return bool(Cursor(self.anchor.children[1], stack=deque(maxlen=1)).find(k))
 
     def __len__(self):
         return self.size
 
+    def islice(self, start=None, stop=None, reversed=False):
+        direction = int(not reversed)
+        sort_op = (operator.gt, operator.lt)[direction]
+        continue_test = lambda k: sort_op(k, stop)
+        cur = Cursor(self.anchor.children[1], direction)
+
+        cur.find(limits[direction ^ 1] if (start is None) else start)
+        if cur.has_result and (stop is None or continue_test(cur.node.k)):
+            yield cur.node.k
+
+        if stop is not None:
+            yield from itertools.takewhile(continue_test, cur)
+        else:
+            yield from cur
+
     def __iter__(self):
-        path_nodes = []
-        path_course_taken = []
-        node = self.anchor
-        course = 1
-        while path_nodes or course == 1:
-            # try move
-            if course & -2: #go up
-                node = path_nodes.pop()
-                course = path_course_taken.pop()
-            elif node.children[course] is not None: #try go down
-                path_nodes.append(node)
-                path_course_taken.append(course)
-                node = node.children[course]
-                course = -1
-            # pivot ccw
-            course += 1
-            if course == 1:
-                yield node.k
+        return self.islice()
