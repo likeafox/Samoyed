@@ -17,7 +17,7 @@ import base64, re
 class Data:
     @staticmethod
     def validate(v):
-        raise NotImplemented()
+        raise NotImplementedError()
 
 class UInt(Data):
     bits = 31

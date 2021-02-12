@@ -18,7 +18,7 @@ set to a sane default. The defaults shouldn't be assumed to be acceptable
 though. You should review all the options and in particular it's recommended
 that owner_key be set to a passphrase generated with a high amount of entropy.
 Any good password generator will do, and a procedure like this is also
-acceptible: https://www.eff.org/dice
+acceptable: https://www.eff.org/dice
 
 2. Initialize the database:
 >>> db.create_all()

@@ -36,6 +36,7 @@ class IO:
         changing its size in stream. As with all the other io operations,
         the stream cursor must be at the end of the blob that was just
         processed when the function exits."""
+        raise NotImplementedError()
 
 class SequentialStorage:
     pass

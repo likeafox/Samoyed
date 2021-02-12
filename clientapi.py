@@ -35,8 +35,8 @@ class SomeRandomness:
     OS's crypto, which is available via python 3.6's built-in
     secrets module.  If the secrets module is not available,
     attempt to fall back to PyCryptodome, which also seems good.'''
-    #for future reference:
-    #https://www.schneier.com/academic/paperfiles/fortuna.pdf
+    #reference (link updated 2021-01-19, the old one was dead):
+    #https://www.schneier.com/wp-content/uploads/2015/12/fortuna.pdf
 
     def __init__(self):
         try:
