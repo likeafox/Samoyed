@@ -12,6 +12,7 @@ import io
 
 # local imports
 import selfdelimitedblob
+from searchtree import SearchTree
 
 
 
@@ -140,7 +141,7 @@ class StrandData(ByteData):
         cls.byte_length().validate(len(v))
 
 class StrandDataLength(RangedUInt):
-    valid_range = (1, 512 + 1)
+    valid_range = range(1, 512 + 1)
 
 
 
@@ -210,6 +211,7 @@ class UnitBase(metaclass=unit_metaclass):
 
 class Unit(UnitBase):
     additional_data_defs = {'typeid':UnitTypeID}
+    cached = None
 
 
 
@@ -217,96 +219,138 @@ class Unit(UnitBase):
 
 class ARFSpec():
     def __init__(self, inherit=None):
-        self._list = {} if inherit is None else inherit._list.copy()
+        if inherit is None:
+            self._listing = {}
+            self.txs_mods = []
+            self.glob_mods = []
+        else:
+            self._listing = inherit._listing.copy()
+            self.txs_mods = inherit.txs_mods.copy()
+            self.glob_mods = inherit.glob_mods.copy()
+        self._all_mods = []
 
     def __getitem__(self, key):
-        return self._list[key]
+        return self._listing[key]
 
     def reverse_lookup(self, datatype):
         if isinstance(datatype, Unit):
             datatype = datatype.__class__
         elif not issubclass(datatype, Unit):
             raise TypeError()
-        for k,v in self._list:
+        for k,v in self._listing:
             if v is datatype:
                 return k
         raise LookupError()
 
-    def __contains__(self, key):
-        return key in self._list or \
-               (issubclass(key, Unit) and key in self._list.values())
+    def __iter__(self):
+        return iter(self._listing)
+
+    # def has_index_or_unit_type(self, key):
+    #     return key in self._listing or \
+    #            (issubclass(key, Unit) and key in self._listing.values())
+
+    def unit_types(self):
+        return self._listing.values()
+
+    @property
+    def all_mods(self):
+        if len(self._all_mods) != (len(self.txs_mods) + len(self.glob_mods)):
+            self._all_mods = self.txs_mods + self.glob_mods
+        return self._all_mods
+
+    def applicable_mod_types_for(self, subject_ut):
+        if not subject_ut in self.unit_types():
+            raise LookupError()
+        if subject_ut.grammar != 'SUBJECT':
+            return [] # only SUBJECTs can have mods applied
+        if subject_ut.scope == 'TX':
+            return self.all_mods
+        assert subject_ut.scope == 'GLOBAL'
+        return self.glob_mods
 
     def register(self, id):
         UnitTypeID.validate(id)
-        if id in self._list:
+        if id in self._listing:
             raise ValueError("Unit type already registered")
-        def d(c):
-            assert issubclass(c, Unit)
+        def d(ut):
+            assert issubclass(ut, Unit)
             ok_range = UnitTypeID.arf_base_defined_range if \
-                (c.__module__ == __name__) else UnitTypeID.app_defined_range
+                (ut.__module__ == __name__) else UnitTypeID.app_defined_range
             if id not in ok_range:
                 raise ValueError("Unit Type ID out of acceptable range " \
                                 f"{ok_range.start}..{ok_range.stop-1}")
-            self._list[id] = c
-            return c
+            self._listing[id] = ut
+
+            if ut.grammar == 'MODIFIER':
+                if ut.scope == 'TX':
+                    self.txs_mods.append(ut)
+                elif ut.scope == 'GLOBAL':
+                    self.glob_mods.append(ut)
+
+            return ut
         return d
 
     def __repr__(self):
-        return f"<{self.__class__.__name__} {id(self)} ({self._list})>"
+        return f"<{self.__class__.__name__} {id(self)} ({self._listing})>"
 
-base = ARFSpec()
+base_spec = ARFSpec()
 
 # Built-in Unit types
 
-@base.register(2)
+@base_spec.register(2)
 class TxScopeMarker(Unit):
     additional_data_defs = {'prev-txs': TxScopeID, 'next-txs': TxScopeID}
-    roles = {'relationship:': 'SCOPE-CONTROLLER',
-             'scope': 'GLOBAL',
-             'persistence': 'ELAPSING'}
+    grammar = 'SCOPE-CONTROLLER'
+    scope = 'GLOBAL'
+    persistence = 'ELAPSING'
 
-@base.register(3)
+@base_spec.register(3)
 class TxScopeFinalize(Unit):
     additional_data_defs = {'release-or-commit': Bool}
-    roles = {'relationship': 'MODIFIER',
-             'scope': 'TX',
-             'persistence': 'ELAPSING'}
+    cached = 'release-or-commit'
+    grammar = 'MODIFIER'
+    scope = 'TX'
+    persistence = 'ELAPSING'
 
-@base.register(4)
+@base_spec.register(4)
 class StrandSelect(Unit):
     additional_data_defs = {'strd-id': StrandID}
-    roles = {'relationship': 'MODIFIER',
-             'scope': 'TX',
-             'persistence': 'REFRESHING'}
+    cached = 'strd-id'
+    grammar = 'MODIFIER'
+    scope = 'TX'
+    persistence = 'REFRESHING'
 
-@base.register(5)
+@base_spec.register(5)
 class StrandGroupSelect(Unit):
     additional_data_defs = {'strd-group': StrandID,
                             'strd-group-mag': StrandGroupMagnitude}
-    roles = {'relationship': 'MODIFIER',
-             'scope': 'TX',
-             'persistence': 'REFRESHING'}
+    cached = ('strd-group','strd-group-mag')
+    grammar = 'MODIFIER'
+    scope = 'TX'
+    persistence = 'REFRESHING'
 
-@base.register(6)
+@base_spec.register(6)
 class StrandWriteDataBlock(Unit):
     additional_data_defs = {'offset': StrandSize, 'data': StrandData}
-    roles = {'relationship': 'OBJECT',
-             'scope': 'TX',
-             'persistence': 'REFRESHING'}
+    cached = 'offset'
+    grammar = 'SUBJECT'
+    scope = 'TX'
+    persistence = 'REFRESHING'
 
-@base.register(7)
+@base_spec.register(7)
 class StrandCreateUpdate(Unit):
     additional_data_defs = {'strd-size-bytes': StrandSize}
-    roles = {'relationship': 'OBJECT',
-             'scope': 'TX',
-             'persistence': 'REFRESHING'}
+    cached = 'strd-size-bytes'
+    grammar = 'SUBJECT'
+    scope = 'TX'
+    persistence = 'REFRESHING'
 
-@base.register(8)
+@base_spec.register(8)
 class StrandDiscard(Unit):
     additional_data_defs = {'strd-group-member-sub-id-sz-bits': UnitTypeID}
-    roles = {'relationship':'OBJECT',
-             'scope':'TX',
-             'persistence': 'ELAPSING'}
+    grammar ='SUBJECT'
+    scope ='TX'
+    persistence = 'ELAPSING'
 
 
 
@@ -337,13 +381,14 @@ class ARFIOWrapper(selfdelimitedblob.IO):
         return datatype.unpack(data)
 
     def read_next(self, select=None):
-        """Read data from the unit next in stream. If the unit has been
-        deleted, return None. Otherwise, the default behaviour is to return
-        the data as a new Unit instance. Optionally, `select` can be a list of
-        unit pieces to read, in which case a list of the resulting pieces is
-        returned. Only data that is requested is read so if an empty list is
-        provided, the function will prerform only the minimal reads necessary
-        to seek to the end of the unit in stream."""
+        """Read data from the unit next in stream. If the unit has been deleted,
+        return None. Otherwise, the default behaviour is to return the data as a
+        new Unit instance. Optionally, `select` can be a list of unit pieces to
+        read, in which case a list of the resulting pieces is returned. Only
+        data that is requested is read so if an empty list is provided, the
+        function will perform only the minimal reads necessary to seek to the
+        end of the unit in stream (at minimum, the unit type id will be read).
+        """
         unit_pcs = [self._read_data(dt) for dt in Unit.data_spec]
         unit_typeid = unit_pcs[Unit.key_to_piece_index('typeid')]
 
@@ -414,22 +459,232 @@ class ARFIOWrapper(selfdelimitedblob.IO):
 
 
 
-# Mappings
+# Mapping
 
-class ARFMap:
+class ARFMapper:
+
     class UnitInfo:
-        def __init__(self, cached_id):
-            self.cached_id = cached_id
+        __slots__ = ('store_id','txs','typeid','cached_pcs','mod_assoc')
 
-    def __init__(self, unit_type_listing, *includes):
-        self.initial_txscope = None
+        def __getitem__(self, k):
+            """Get cached unit data, with a fall-back to a read operation on the stored
+            unit.
+
+            The various forms of `k`, and what the function returns for each:
+
+            "store_id" : The id of the unit, assigned by the storage.
+            "txs" :     Id of the transaction scope the unit is in (or None if the unit
+                        is in the global scope).
+            "typeid" :  Id of the unit's unit type.
+            "cached_pcs" : Internal cached unit piece(s). Do not use.
+            "mod_assoc" : Internal modifier associativity data. Do not use.
+            "type" :    The unit's class.
+            <Applicable mod type> : For a unit with the 'SUBJECT' grammar role, this
+                        returns the modifier id (assigned by the mapper) for the
+                        modifier of the applicable type. This can also return valid ids
+                        for future modifiers that don't exist yet.
+            "mod_id" :  If the unit is a modifier, return its modifier id.
+            None :      Do a full read from storage to return the Unit itself.
+            <Piece index or name> : The unit piece's value. Reads from storage if the
+                        value is not cached.
+            <Sequence of piece indices or names> : Same as above but returns a Sequence
+                        of any number of piece values.
+            """
+            if k in ARFMapper.UnitInfo.__slots__:
+                return getattr(self, k)
+
+            ut = self.unit_type
+
+            if k == 'type':
+                return ut
+            if issubclass(k, Unit) and \
+                    k in self.mapper.ut_listing.applicable_mod_types_for(ut):
+                return self.mod_assoc[self.mapper.ut_listing.all_mods.index(k)]
+            if ut.grammar == 'MODIFIER' and k == 'mod_id':
+                return self.mod_assoc
+
+            howtoread = None
+            if k is None:
+                select = None
+                howtoread = 'nonsingle'
+            elif isinstance(k, collections.abc.Sequence):
+                select = list(map(ut.key_to_piece_index, k)) # fails if piece indices are invalid
+                named_select_set = set(ut.piece_names[i] for i in select)
+                if named_select_set <= set(ut.cached): 
+                    return [ self.cached_pcs[ut.cached.index(pn)]
+                                for pn in named_select_set ]
+                howtoread = 'nonsingle'
+            else:
+                try:
+                    i = ut.key_to_piece_index(k)
+                except TypeError:
+                    pass
+                else:
+                    using_single = True
+                    piece_name = ut.piece_names[i]
+                    if k == cache:
+                        return self.cached_pcs
+                    if isinstance(ut.cached, collections.abc.Sequence) and k in ut.cached:
+                        return self.cached_pcs[cached.index(k)]
+                    select = [i]
+                    howtoread = 'single'
+            if howtoread:
+                r = self.mapper.storage.read(self.store_id, select=select)
+                return r[0] if howtoread == 'single' else r
+
+            raise LookupError(f"No results for key {k}>")
+
+        def __init__(self, store_id, unit_type, cur_txscope, glob_mod_ids,
+                     txs_mod_ids):
+            ut = unit_type
+            ut_listing = self.mapper.ut_listing
+
+            self.store_id = store_id
+            self.txs = cur_txscope if (ut.scope == 'TX') else None
+            self.typeid = ut_listing.reverse_lookup(ut)
+
+            # load/set cached unit pieces
+            if ut.cached is None:
+                self.cached_pcs = None
+            else:
+                multi = isinstance(ut.cached, collections.abc.Sequence)
+                select = ut.cached if multi else [ut.cached]
+                data = self.mapper.storage.read(self.store_id, select=select)
+                self.cached_pcs = data if multi else data[0]
+
+            # set modifier associativity
+            if ut.grammar == 'MODIFIER':
+                ids_for_scope, mod_types_for_scope = {
+                    'GLOBAL': (glob_mod_ids, ut_listing.glob_mods),
+                    'TX': (txs_mod_ids, ut_listing.txs_mods)
+                }[ut.scope]
+                self.mod_assoc = ids_for_scope[mod_types_for_scope.index(ut)]
+            elif ut.grammar == 'SUBJECT':
+                self.mod_assoc = list(glob_mod_ids) #copy
+                if ut.scope == 'TX':
+                    self.mod_assoc += txs_mod_ids
+            else:
+                self.mod_assoc = None
+
+        @property
+        def unit_type(self):
+            return self.mapper.ut_listing[self.typeid]
+
+    class Index:
+        def __init__(self, order_keys, uh):
+            self.id = None
+            pass
+
+        def __iter__(self):
+            pass
+
+    class Query:
+        def __init__(self, index=None):
+            if index is None:
+                self.results = (self.mapper.units.values(),)
+            else:
+                idx_obj = self.mapper.Index(index)
+                self.results = self.mapper.indexes.setdefault()
+            self.ops = []
+
+        def copy(self):
+            new = self.__new__(self.__class__)
+            new.index = self.index
+            new.ops = self.ops.copy()
+            return new
+
+        def selector(self, f):
+            q = self.copy()
+            return q
+
+        def join(self, other_index):
+            q = self.copy()
+            return q
+
+        def __iter__(self):
+            return self
+
+    def __init__(self, unit_type_listing, storage):
+        self.ut_listing = unit_type_listing
+        self.storage = storage
+
+        # self.initial_txscope = None
         self.cur_txscope = None
         self.last_sync_id = -1
-        self.unit_type_listing = unit_type_listing
-        #self.unit_types
 
-    def sync():
-        pass
+        self.units = {}
+        self.indexes = {}
+
+        self.mod_next_ids_per_txs = collections.defaultdict(
+            lambda: [0] * len(unit_type_listing.txs_mods))
+        self.mod_next_ids_per_txs[None] = [0] * len(unit_type_listing.glob_mods)
+
+        for c in (self.UnitInfo, self.Index, self.Query):
+            attrs = dict([('mapper',self), ('__slots__',())]
+                            [:1 + hasattr(c, "__slots__")])
+            newtype = type(c.__name__, (c,), attrs)
+            newtype.__qualname__ = f"{repr(self)}.{newtype.__name__}"
+            setattr(self, newtype.__name__, newtype)
+
+        self._sync_gen = _sync_gen_func()
+
+    def _map_unit(self, store_id, ut):
+        assert ut.scope == 'GLOBAL' or self.cur_txscope is not None
+        info = self.UnitInfo(store_id, ut, self.cur_txscope,
+                             self.mod_next_ids_per_txs[None],
+                             self.mod_next_ids_per_txs[self.cur_txscope])
+        self.units[store_id] = info
+
+        if ut.grammar == 'MODIFIER':
+            mod_i = self.ut_listing.txs_mods.index(ut) if ut.scope == 'TX' \
+                    else self.ut_listing.glob_mods.index(ut)
+            self.mod_next_ids_per_txs[info['txs']][mod_i] += 1
+
+        # todo: also map into Indexes
+
+    def _sync_gen_func(self):
+        read_it = lambda st: self.storage.multi_read_iter(st, select=['typeid'])
+        last_sync_id = -1
+
+        # sync global units, until any tx unit comes up
+        cont_glob = True
+        while cont_glob:
+            for store_id, (typeid,) in read_it(last_sync_id + 1):
+                ut = self.ut_listing[typeid]
+                if ut.scope != 'GLOBAL' or ut.grammar == 'SCOPE-CONTROLLER':
+                    cont_glob = False
+                    break
+                self._map_unit(store_id, ut)
+                last_sync_id = store_id
+            else:
+                yield
+
+        # next, idle until a txs marker shows up
+        last_scan_ahead_id = last_sync_id
+        txs_marker_typeid = self.ut_listing.reverse_lookup(TxScopeMarker)
+        while self.cur_txscope is None:
+            for store_id, (typeid,) in read_it(last_scan_ahead_id + 1):
+                last_scan_ahead_id = store_id
+                if typeid == txs_marker_typeid:
+                    self.cur_txscope = self.storage.read(store_id, select=['prev-txs'])
+                    break
+            else:
+                yield
+
+        # main loop
+        while True:
+            for store_id, (typeid,) in read_it(last_sync_id + 1):
+                last_sync_id = store_id
+                self._map_unit(store_id, self.ut_listing[typeid])
+            yield
+
+    def sync(self):
+        next(self._sync_gen)
+
+    @property
+    def q(self):
+        "just a shorthand for .Query"
+        return self.Query
 
 
 
@@ -452,7 +707,7 @@ class ARFStrand(io.BytesIO):
 class ARFManager:
     def __init__(self, cache=None,
                        transit=None,
-                       unit_type_listing=base):
+                       unit_type_listing=base_spec):
         pass
 
     def e(self) -> io.BytesIO:
