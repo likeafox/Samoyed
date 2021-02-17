@@ -465,6 +465,7 @@ class ARFMapper:
 
     class UnitInfo:
         __slots__ = ('store_id','txs','typeid','cached_pcs','mod_assoc')
+        READ_REQUIRED = object()
 
         def __getitem__(self, k):
             """Get cached unit data, with a fall-back to a read operation on the stored
@@ -479,7 +480,7 @@ class ARFMapper:
             "cached_pcs" : Internal cached unit piece(s). Do not use.
             "mod_assoc" : Internal modifier associativity data. Do not use.
             "type" :    The unit's class.
-            <Applicable mod type> : For a unit with the 'SUBJECT' grammar role, this
+            <Applicable mod class> : For a unit with the 'SUBJECT' grammar role, this
                         returns the modifier id (assigned by the mapper) for the
                         modifier of the applicable type. This can also return valid ids
                         for future modifiers that don't exist yet.
@@ -487,9 +488,25 @@ class ARFMapper:
             None :      Do a full read from storage to return the Unit itself.
             <Piece index or name> : The unit piece's value. Reads from storage if the
                         value is not cached.
-            <Sequence of piece indices or names> : Same as above but returns a Sequence
-                        of any number of piece values.
+            <tuple of other non-None `k` values> : a tuple containing results
+                        corresponding to each key.
             """
+            if k is None:
+                return self.mapper.storage.read(self.store_id, select=[])
+            multi = type(k) is tuple
+            ks = k if multi else (k,)
+
+            cache_results = [self._get_single_no_read(k) for k in ks]
+            read_select = [k for k,r in zip(ks, cache_results)
+                            if r is self.READ_REQUIRED]
+            if read_select:
+                read_results = iter(self.mapper.storage.read(self.store_id,
+                                                        select=read_select))
+            results = tuple((r if r is not self.READ_REQUIRED else \
+                            next(read_results)) for r in cache_results)
+            return results if multi else results[0]
+
+        def _get_single_no_read(self, k):
             if k in ARFMapper.UnitInfo.__slots__:
                 return getattr(self, k)
 
@@ -503,34 +520,17 @@ class ARFMapper:
             if ut.grammar == 'MODIFIER' and k == 'mod_id':
                 return self.mod_assoc
 
-            howtoread = None
-            if k is None:
-                select = None
-                howtoread = 'nonsingle'
-            elif isinstance(k, collections.abc.Sequence):
-                select = list(map(ut.key_to_piece_index, k)) # fails if piece indices are invalid
-                named_select_set = set(ut.piece_names[i] for i in select)
-                if named_select_set <= set(ut.cached): 
-                    return [ self.cached_pcs[ut.cached.index(pn)]
-                                for pn in named_select_set ]
-                howtoread = 'nonsingle'
+            try:
+                i = ut.key_to_piece_index(k)
+            except TypeError:
+                pass
             else:
-                try:
-                    i = ut.key_to_piece_index(k)
-                except TypeError:
-                    pass
-                else:
-                    using_single = True
-                    piece_name = ut.piece_names[i]
-                    if k == cache:
-                        return self.cached_pcs
-                    if isinstance(ut.cached, collections.abc.Sequence) and k in ut.cached:
-                        return self.cached_pcs[cached.index(k)]
-                    select = [i]
-                    howtoread = 'single'
-            if howtoread:
-                r = self.mapper.storage.read(self.store_id, select=select)
-                return r[0] if howtoread == 'single' else r
+                piece_name = ut.piece_names[i]
+                if piece_name == ut.cached:
+                    return self.cached_pcs
+                if isinstance(ut.cached, (tuple,list)) and piece_name in ut.cached:
+                    return self.cached_pcs[ut.cached.index(piece_name)]
+                return self.READ_REQUIRED
 
             raise LookupError(f"No results for key {k}>")
 
@@ -547,7 +547,7 @@ class ARFMapper:
             if ut.cached is None:
                 self.cached_pcs = None
             else:
-                multi = isinstance(ut.cached, collections.abc.Sequence)
+                multi = isinstance(ut.cached, (tuple, list))
                 select = ut.cached if multi else [ut.cached]
                 data = self.mapper.storage.read(self.store_id, select=select)
                 self.cached_pcs = data if multi else data[0]
