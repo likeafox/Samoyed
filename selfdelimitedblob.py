@@ -1,4 +1,4 @@
-__all__ = ["IO","SequentialStorage","MemoryOnlyStorage"]
+__all__ = ["IO","BlobNotFoundError","SequentialStorage","MemoryOnlyStorage"]
 
 import io
 
@@ -38,6 +38,9 @@ class IO:
         processed when the function exits."""
         raise NotImplementedError()
 
+class BlobNotFoundError(LookupError):
+    pass
+
 class SequentialStorage:
     pass
 
@@ -64,8 +67,11 @@ class MemoryOnlyStorage(SequentialStorage):
 
     def reset(self):
         self.test_closed()
-        self.id_ctr = 0 # first id will be 1
+        self.id_ctr = 0 # first id will be 1 (the minimum allowed)
         self.store = {}
+
+    def __contains__(self, id):
+        return id in self.store
 
     def append(self, obj):
         self.id_ctr += 1
@@ -75,7 +81,10 @@ class MemoryOnlyStorage(SequentialStorage):
         return self.id_ctr
 
     def read(self, id, **opts):
-        s = io.BytesIO(self.store[id])
+        try:
+            s = io.BytesIO(self.store[id])
+        except KeyError:
+            raise BlobNotFoundError()
         return self.io_interface(s).read_next(**opts)
 
     def multi_read_iter(self, start_id=0, end_id=float('inf'), **opts):
@@ -86,7 +95,10 @@ class MemoryOnlyStorage(SequentialStorage):
                 yield (id, r)
 
     def discard(self, id):
-        del self.store[id]
+        try:
+            del self.store[id]
+        except KeyError:
+            raise BlobNotFoundError()
 
     def discard_all_before(self, id):
         self.store = dict((k,v) for k,v in self.store.items() if k >= id)
