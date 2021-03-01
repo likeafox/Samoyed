@@ -56,10 +56,10 @@ class Cursor:
                     break
                 self.path_nodes.append(n)
             self.has_result = n is not None
-        else: #go to limit
+        else: #go to the limit
             course = limits.index(k)
             n = self.path_nodes[-1].children[course]
-            while n is not None:
+            while n is not None: # come on, fhqwhgads
                 self.path_nodes.append(n)
                 n = n.children[course]
             self.has_result = True
@@ -148,6 +148,14 @@ class SearchTree:
         self.size = 0
         self._clear_last_found()
 
+    @property
+    def root(self):
+        return self.anchor.children[1]
+
+    @root.setter
+    def root(self, v):
+        self.anchor.children[1] = v
+
     def insert_or_replace(self, node_or_k):
         new_node = node_or_k if isinstance(node_or_k,Node) else Node(node_or_k)
         k = new_node.k
@@ -167,8 +175,8 @@ class SearchTree:
         else:
             parent = path[drop_depth]
             course = int(parent.k < k)
-            node = parent.children[course]
-            parent.children[course] = node
+            node = parent.children[course] #node being displaced
+            parent.children[course] = new_node
             course = int(k < node.k)
             new_node.children[course] = node
 
@@ -221,7 +229,7 @@ class SearchTree:
     def _try_find_node(self, k):
         if k == self.last_found.k:
             return self.last_found
-        node = Cursor(self.anchor.children[1], stack=deque(maxlen=1)).find(k).node
+        node = Cursor(self.root, stack=deque(maxlen=1)).find(k).node
         if node is not None:
             self.last_found = node
         return node
@@ -236,7 +244,7 @@ class SearchTree:
         if direction is None:
             direction = self.default_iter_direction
         valid_keys = KeyspaceSlice(None, stop, direction)
-        cur = Cursor(self.anchor.children[1], direction)
+        cur = Cursor(self.root, direction)
 
         cur.find(limits[direction ^ 1] if (start is None) else start)
         if cur.has_result and cur.node.k in valid_keys:
