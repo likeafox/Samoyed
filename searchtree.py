@@ -1,6 +1,6 @@
 # copyright (c) 2021 Jason Forbes
 
-import random, itertools, operator
+import random, itertools
 from collections import deque, namedtuple
 import collections.abc
 
@@ -175,7 +175,7 @@ class SearchTree:
         else:
             parent = path[drop_depth]
             course = int(parent.k < k)
-            node = parent.children[course] #node being displaced
+            node = parent.children[course] #node is the node being displaced
             parent.children[course] = new_node
             course = int(k < node.k)
             new_node.children[course] = node
@@ -272,7 +272,7 @@ class SearchTreeMap(SearchTree, collections.abc.MutableMapping):
     def __getitem__(self, k):
         if type(k) is slice:
             ksslice = KeyspaceSlice(None, None, self.default_iter_direction)[k]
-            return SearchTreeMapSlice(self, ksslice)
+            return self._getsliceview(ksslice)
         node = self._find(k).node
         if node is None:
             raise KeyError()
@@ -292,6 +292,9 @@ class SearchTreeMap(SearchTree, collections.abc.MutableMapping):
             self.delete(k)
         except LookupError:
             raise KeyError()
+
+    def _getsliceview(self, ksslice):
+        return SearchTreeMapSliceView(self, ksslice)
 
 
 
