@@ -96,7 +96,7 @@ class Cursor:
             course += (self.iter_direction << 1) - 1
             if course == self.iter_direction:
                 self.has_result = True
-                return node().k
+                return node()
 
 
 
@@ -132,6 +132,23 @@ class KeyspaceSlice:
         stop = slice_.stop if (slice_.stop in self) else self.stop
         return self.__class__(start, stop, self.direction)
 
+KeyspaceSlice.default = KeyspaceSlice(None, None, directions.right)
+
+
+
+def TreeIterator(root:Node, s:KeyspaceSlice = KeyspaceSlice.default):
+    continue_test = KeyspaceSlice(None, s.stop, s.direction).contains_test
+    cur = Cursor(root, s.direction)
+    cur.find(limits[s.direction ^ 1] if (s.start is None) else s.start)
+
+    if cur and continue_test(cur.node.k):
+        yield cur.node
+
+    if s.stop is not None:
+        yield from itertools.takewhile(continue_test, cur)
+    else:
+        yield from cur
+
 
 
 class SearchTree:
@@ -139,13 +156,14 @@ class SearchTree:
         def __lt__(self, other):
             return True
 
-    def __init__(self, default_iter_direction=directions.right):
-        self.default_iter_direction = default_iter_direction
+    def __init__(self):
+        self.version = 0
         self.clear()
 
     def clear(self):
         self.anchor = Node(self.AnchorK())
         self.size = 0
+        self.version += 1
         self._clear_last_found()
 
     @property
@@ -153,10 +171,12 @@ class SearchTree:
         return self.anchor.children[1]
 
     @root.setter
-    def root(self, v):
-        self.anchor.children[1] = v
+    def root(self, n):
+        self.version += 1
+        self.anchor.children[1] = n
 
     def insert_or_replace(self, node_or_k):
+        self.version += 1
         new_node = node_or_k if isinstance(node_or_k,Node) else Node(node_or_k)
         k = new_node.k
         find_existing = Cursor(self.anchor, stack=[]).find(k)
@@ -198,6 +218,7 @@ class SearchTree:
         self.size += 1
 
     def delete(self, k):
+        self.version += 1
         if self.last_found.k == k:
             self._clear_last_found()
         find_del = Cursor(self.anchor, stack=deque(maxlen=2)).find(k)
@@ -240,23 +261,18 @@ class SearchTree:
     def __len__(self):
         return self.size
 
-    def _islice(self, start=None, stop=None, direction=None):
-        if direction is None:
-            direction = self.default_iter_direction
-        valid_keys = KeyspaceSlice(None, stop, direction)
-        cur = Cursor(self.root, direction)
-
-        cur.find(limits[direction ^ 1] if (start is None) else start)
-        if cur.has_result and cur.node.k in valid_keys:
-            yield cur.node.k
-
-        if stop is not None:
-            yield from itertools.takewhile(valid_keys.contains_test, cur)
-        else:
-            yield from cur
+    def _keys_iter(self, *args, **kwargs):
+        init_version = self.version
+        def it():
+            for n in TreeIterator(self.root, *args, **kwargs):
+                if self.version != init_version:
+                    raise RuntimeError("Tree was modified during iteration.")
+                self.last_found = n
+                yield n.k
+        return it()
 
     def __iter__(self):
-        return self._islice()
+        return self._keys_iter()
 
 
 
@@ -271,9 +287,9 @@ class MapNode(Node):
 class SearchTreeMap(SearchTree, collections.abc.MutableMapping):
     def __getitem__(self, k):
         if type(k) is slice:
-            ksslice = KeyspaceSlice(None, None, self.default_iter_direction)[k]
+            ksslice = KeyspaceSlice(k.start, k.stop, self.default_iter_direction)[k]
             return self._getsliceview(ksslice)
-        node = self._find(k).node
+        node = self._try_find_node(k).node
         if node is None:
             raise KeyError()
         return node
@@ -304,7 +320,7 @@ class SearchTreeMapSliceView(collections.abc.Mapping):
         self.ksslice = ksslice
 
     def __contains__(self, k):
-        return k in self.ksslice and k in tree
+        return k in self.ksslice and k in self.tree
 
     def __getitem__(self, k):
         if type(k) is slice:
@@ -314,8 +330,13 @@ class SearchTreeMapSliceView(collections.abc.Mapping):
         return tree[k]
 
     def __iter__(self):
-        return tree._islice(self.ksslice.start, self.ksslice.stop)
+        return self.tree._keys_iter(self.ksslice)
 
     def __len__(self):
         # what a horrible function
         return sum(1 for _ in iter(self))
+
+    def __bool__(self):
+        for _ in self(iter):
+            return True
+        return False
