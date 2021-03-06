@@ -58,6 +58,7 @@ class DenseIntegerSet(collections.abc.MutableSet):
         view = memoryview(seg)[self.segment_bytelen:]
         new_v = int.from_bytes(view, 'little') + v
         view[:] = new_v.to_bytes(len(view), 'little')
+        self.size += v
         return new_v
 
     def add(self, k):

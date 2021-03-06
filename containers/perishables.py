@@ -1,23 +1,14 @@
 # copyright (c) 2021 Jason Forbes
 
-import collections, sys
+import collections.abc, sys
 from contextlib import contextmanager
 from .searchtree import SearchTreeMap, SearchTreeMapSliceView
 
 
 
-class PerishablesMapInterfaceMixin:
+class PerishablesContainerInterfaceMixin:
     def __iter__(self):
         return self.perishables_owner._iter_wrapper(super().__iter__())
-
-    def __getitem__(self, k):
-        r = super().__getitem__(k)
-        if type(k) is slice or self.perishables_owner.test_valid(k):
-            return r
-        else:
-            self.perishables_owner.expired.add(k)
-            self.perishables_owner.try_release_expired()
-            raise KeyError()
 
     def __contains__(self, k):
         if super().__contains__(k):
@@ -37,16 +28,26 @@ class PerishablesMapInterfaceMixin:
             return True
         return False
 
+class PerishablesMapInterfaceMixin(PerishablesContainerInterfaceMixin):
+    def __getitem__(self, k):
+        r = super().__getitem__(k)
+        if type(k) is slice or self.perishables_owner.test_valid(k):
+            return r
+        else:
+            self.perishables_owner.expired.add(k)
+            self.perishables_owner.try_release_expired()
+            raise KeyError()
 
 
-class PerishablesMapMixin(PerishablesMapInterfaceMixin):
+
+class PerishablesContainerMixin(PerishablesContainerInterfaceMixin):
     def __init__(self, test_valid, *args, **kwargs):
         """test_valid(key) is only used to test keys that currently exist in the
         underlying map. It is not called for non-existant/prospective keys."""
         super().__init__(*args, **kwargs)
         self.perishables_owner = self
         if test_valid is not None:
-            self.test_valid = test_valid
+            self.__dict__['test_valid'] = test_valid
         self.iters_open = 0
         self.expired = set()
 
@@ -57,13 +58,6 @@ class PerishablesMapMixin(PerishablesMapInterfaceMixin):
             self._release_action(k)
         self.expired.clear()
         return True
-
-    def _release_action(self, k):
-        "Override this in classes that don't have __delitem__ implemented."
-        try:
-            del self[k]
-        except KeyError:
-            pass
 
     @contextmanager
     def _iter_context(self):
@@ -81,6 +75,17 @@ class PerishablesMapMixin(PerishablesMapInterfaceMixin):
                     yield k
                 else:
                     self.expired.add(k)
+
+class PerishablesSetMixin(PerishablesContainerMixin):
+    def _release_action(self, k):
+        self.discard(k)
+
+class PerishablesMapMixin(PerishablesContainerMixin, PerishablesMapInterfaceMixin):
+    def _release_action(self, k):
+        try:
+            del self[k]
+        except KeyError:
+            pass
 
 
 
@@ -129,7 +134,34 @@ class AutoContainerMapMixin(AutoContainerMapInterfaceMixin, PerishablesMapMixin)
 
 
 
+class UserSet(collections.abc.MutableSet):
+    def __init__(self, iterable=()):
+        self.data = set(iterable)
+
+    def __contains__(self, k):
+        return k in self.data
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
+    def add(self, k):
+        self.data.add(k)
+
+    def discard(self, k):
+        self.data.discard(k)
+
+    def __repr__(self):
+        return repr(self.data)
+
+
+
 # Prebuilts
+
+class PerishablesSet(PerishablesSetMixin, UserSet):
+    pass
 
 class PerishablesMap(PerishablesMapMixin, collections.UserDict):
     pass
@@ -143,6 +175,8 @@ class PerishablesSearchTreeMapSliceView(PerishablesMapInterfaceMixin,
 class PerishablesSearchTreeMap(PerishablesMapMixin, SearchTreeMap):
     def _getsliceview(self, ksslice):
         return PerishablesSearchTreeMapSliceView(self, ksslice)
+
+class AutoContainerMap(AutoContainerMapMixin, collections.UserDict)
 
 class AutoContainerSearchTreeMapSliceView(AutoContainerMapInterfaceMixin,
                                           PerishablesSearchTreeMapSliceView):
