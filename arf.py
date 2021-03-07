@@ -7,12 +7,15 @@ import sys
 assert (sys.version_info.major, sys.version_info.minor) >= (3, 7)
 
 from itertools import islice
-import collections.abc
-import io
+from dataclasses import dataclass
+import collections.abc, io, heapq, weakref
 
 # local imports
 import selfdelimitedblob
-from searchtree import SearchTree
+import containers.searchtree
+from containers.perishables import PerishablesSet, PerishablesMap, \
+    PerishablesSearchTreeMap, AutoContainerMap, AutoContainerSearchTreeMap
+from containers.dense import DenseIntegerSet
 
 
 
@@ -103,7 +106,7 @@ class StrandGroupMagnitude(ByteInt):
     valid_range = range(1, StrandID.bit_length)
     @classmethod
     def to_strand_group_mask(cls, v):
-        return -1 << v
+        return (1 << v) - 1 # can also be expressed ~(-1 << v)
 
 class Bool(ByteInt):
     @classmethod
@@ -164,7 +167,7 @@ class unit_metaclass(type):
             pass
         else:
             base_len = len(ds)
-            if not set(pns).isdisjoint(set(add_dds)):
+            if not pns.keys().isdisjoint(add_dds.keys()):
                 raise ValueError("Unit definition has conflicting data labels")
             ds.extend(add_dds.values())
             pns.update((name,i) for i,name in enumerate(add_dds, base_len))
@@ -461,7 +464,18 @@ class ARFIOWrapper(selfdelimitedblob.IO):
 
 # Mapping
 
-class ARFMapper:
+class Queryable:
+    # Queryables have the following defined:
+    #
+    #   iter_with_constraints (constraints:dict={})
+    #
+    #   __iter__ ()
+    #
+    #   mapper
+    #
+    pass
+
+class ARFMapper(Queryable):
 
     class UnitInfo:
         __slots__ = ('store_id','txs','typeid','cached_pcs','mod_assoc')
@@ -507,7 +521,10 @@ class ARFMapper:
             return results if multi else results[0]
 
         def _get_single_no_read(self, k):
-            if k in ARFMapper.UnitInfo.__slots__:
+            """Does single-item queries about the unit, but only returns values
+            from cache, never storage. Returns UnitInfo.READ_REQUIRED if the
+            item has existed, and may still, but isn't available in cache."""
+            if k in self.__class__.__slots__:
                 return getattr(self, k)
 
             ut = self.unit_type
@@ -570,63 +587,77 @@ class ARFMapper:
         def unit_type(self):
             return self.mapper.ut_listing[self.typeid]
 
-    class Index:
-        def __init__(self, order_keys, uh):
-            self.id = None
+    class Feed:
+        def _nop(*args, **kwargs):
             pass
 
-        def __iter__(self):
-            pass
+        def __init__(self, recv_extend = _nop, recv_delete = _nop):
+            self.last_sync_id = -1
+            self.recv_extend = recv_extend
+            self.recv_delete = recv_delete
 
-    class Query:
-        def __init__(self, index=None):
-            if index is None:
-                self.results = (self.mapper.units.values(),)
-            else:
-                idx_obj = self.mapper.Index(index)
-                self.results = self.mapper.indexes.setdefault()
-            self.ops = []
+        def iter_new_units(self):
+            for k,ui in self.mapper.iter_units(self.last_sync_id + 1):
+                self.last_sync_id = k
+                yield ui
 
-        def copy(self):
-            new = self.__new__(self.__class__)
-            new.index = self.index
-            new.ops = self.ops.copy()
-            return new
+        def notify_extend(self):
+            self.recv_extend(self.iter_new_units())
 
-        def selector(self, f):
-            q = self.copy()
-            return q
+        def notify_delete(self, k):
+            if k <= self.last_sync_id:
+                self.recv_delete(k)
 
-        def join(self, other_index):
-            q = self.copy()
-            return q
+    class UnitsMap(PerishablesSearchTreeMap):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.total_lifetime_units_mapped = 0
+            self.last_notify_sync_id = -1
+            self.last_sync_id = -1
 
-        def __iter__(self):
-            return self
+        def __setitem__(self, k, v):
+            if k <= self.last_sync_id:
+                raise ValueError("Keys must be added to UnitsMap in order")
+            super().__setitem__(k, v)
+            self.last_sync_id = k
+            self.total_lifetime_units_mapped += 1
+
+        def maybe_send_notify_extend(self):
+            if self.last_notify_sync_id != self.last_sync_id:
+                for feed in self.mapper.all_feeds:
+                    feed.notify_extend()
+                self.last_notify_sync_id = self.last_sync_id
+
+        def __delitem__(self, k):
+            super().__delitem__(k)
+            for feed in self.mapper.all_feeds:
+                feed.notify_delete(k)
+
+    # ARFMapper methods
 
     def __init__(self, unit_type_listing, storage):
         self.ut_listing = unit_type_listing
         self.storage = storage
 
-        # self.initial_txscope = None
-        self.cur_txscope = None
-        self.last_sync_id = -1
-
-        self.units = {}
-        self.indexes = {}
-
-        self.mod_next_ids_per_txs = collections.defaultdict(
-            lambda: [0] * len(unit_type_listing.txs_mods))
-        self.mod_next_ids_per_txs[None] = [0] * len(unit_type_listing.glob_mods)
-
-        for c in (self.UnitInfo, self.Index, self.Query):
+        for c in (self.UnitInfo, self.Feed, self.UnitsMap):
             attrs = dict([('mapper',self), ('__slots__',())]
                             [:1 + hasattr(c, "__slots__")])
             newtype = type(c.__name__, (c,), attrs)
             newtype.__qualname__ = f"{repr(self)}.{newtype.__name__}"
             setattr(self, newtype.__name__, newtype)
 
+        self.all_feeds = weakref.WeakSet()
+        self.units = self.UnitsMap(self._unit_valid_test)
+
+        self.cur_txscope = None
+        self.mod_next_ids_per_txs = collections.defaultdict(
+            lambda: [0] * len(unit_type_listing.txs_mods))
+        self.mod_next_ids_per_txs[None] = [0] * len(unit_type_listing.glob_mods)
+
         self._sync_gen = _sync_gen_func()
+
+    def _unit_valid_test(self, store_id):
+        return store_id in self.mapper.storage
 
     def _map_unit(self, store_id, ut):
         assert ut.scope == 'GLOBAL' or self.cur_txscope is not None
@@ -640,27 +671,23 @@ class ARFMapper:
                     else self.ut_listing.glob_mods.index(ut)
             self.mod_next_ids_per_txs[info['txs']][mod_i] += 1
 
-        # todo: also map into Indexes
-
     def _sync_gen_func(self):
         read_it = lambda st: self.storage.multi_read_iter(st, select=['typeid'])
-        last_sync_id = -1
 
         # sync global units, until any tx unit comes up
         cont_glob = True
         while cont_glob:
-            for store_id, (typeid,) in read_it(last_sync_id + 1):
+            for store_id, (typeid,) in read_it(self.units.last_sync_id + 1):
                 ut = self.ut_listing[typeid]
                 if ut.scope != 'GLOBAL' or ut.grammar == 'SCOPE-CONTROLLER':
                     cont_glob = False
                     break
                 self._map_unit(store_id, ut)
-                last_sync_id = store_id
             else:
                 yield
 
         # next, idle until a txs marker shows up
-        last_scan_ahead_id = last_sync_id
+        last_scan_ahead_id = self.units.last_sync_id
         txs_marker_typeid = self.ut_listing.reverse_lookup(TxScopeMarker)
         while self.cur_txscope is None:
             for store_id, (typeid,) in read_it(last_scan_ahead_id + 1):
@@ -673,18 +700,204 @@ class ARFMapper:
 
         # main loop
         while True:
-            for store_id, (typeid,) in read_it(last_sync_id + 1):
-                last_sync_id = store_id
+            for store_id, (typeid,) in read_it(self.units.last_sync_id + 1):
                 self._map_unit(store_id, self.ut_listing[typeid])
             yield
 
+    # ARFMapper interface!
+
     def sync(self):
         next(self._sync_gen)
+        self.units.maybe_send_notify_extend()
+
+    def __getitem__(self, k):
+        if k > self.units.last_sync_id:
+            self.sync()
+        return self.units[k]
+
+    def get(self, k):
+        try:
+            return self[k]
+        except KeyError:
+            return None
+
+    def __contains__(self, k):
+        return self.get(k) is not None
+
+    def iter_units(self, start=0):
+        self.units.try_release_expired()
+        yield from self.units[start:].items()
+
+        last_id_before_sync = self.units.last_sync_id
+        self.sync()
+        yield from self.units[max(last_id_before_sync + 1, start):].items()
+
+    def getfeed(self, *args, **kwargs):
+        feed = self.mapper.Feed(*args, **kwargs)
+        self.all_feeds.add(feed)
+        return feed
+
+    def __iter__(self):
+        return (k for k,v in self.iter_units())
+
+    def iter_with_constraints(self, constraints:dict={}):
+        if constraints != {}:
+            raise ValueError("Mappers are not capable of subselections" \
+                             " using constraints.")
+        return iter(self)
 
     @property
-    def q(self):
-        "just a shorthand for .Query"
-        return self.Query
+    def mapper(self):
+        return self
+
+
+
+class ARFMapperIndex(Queryable):
+    @dataclass
+    class KeyDef:
+        name: str
+        sliceable: bool = False
+
+    class UniquesMapMixin:
+        def test_valid(self, k):
+            v = super(PerishablesMapInterfaceMixin, self).__getitem__(k)
+            return self.__dict__['test_valid'](v)
+    class UniquesMap(UniquesMapMixin, PerishablesMap): pass
+    class UniquesSearchTreeMap(UniquesMapMixin, PerishablesSearchTreeMap): pass
+
+    def __init__(self, *keydefs, unique=False, selector=None, mapper:ARFMapper):
+        self.keydefs = keydefs
+        self.unique = unique
+        self.selector = selector
+        self.mapper = mapper
+
+        def map_factory_for(keydef_i=0):
+            keydef = keydefs[keydef_i]
+            cont_cls = { False: AutoContainerMap,
+                         True: AutoContainerSearchTreeMap }[keydef.sliceable]
+            uniq_cls = { False: self.UniquesMap,
+                         True: self.UniquesSearchTreeMap }[keydef.sliceable]
+
+            if keydef_i != (len(keydefs) - 1):
+                inner = map_factory_for(keydef_i + 1)
+                return lambda: cont_cls(inner)
+            # else, it's the final keydef
+            test = self.mapper._unit_valid_test
+            if unique:
+                return lambda: uniq_cls(test)
+            return lambda: cont_cls(lambda: PerishablesSet(test))
+
+        self.maps = map_factory_for() # fails if no keydefs
+        self.feed = mapper.getfeed(recv_extend=self._recv_extend)
+        self._recv_extend()
+
+    def _recv_extend(self, _=None):
+        for info in self.feed.iter_new_units():
+            self.maybe_add_unit(info)
+
+    def maybe_add_unit(self, unit_info):
+        if (self.selector is not None) and (not self.selector(unit_info)):
+            return
+
+        map_ = self.maps
+        for kd in self.keydefs:
+            k = unit_info[kd.name]
+            if kd is not self.keydefs[-1]:
+                map_ = map_[k]
+
+        if self.unique:
+            assert k not in map_
+            map_[k] = unit_info['store_id']
+        else:
+            map_[k].add(unit_info['store_id'])
+
+    def iter_with_constraints(self, constraints:dict={}):
+        if not constraints.keys() <= set(kd.name for kd in self.keydefs):
+            ValueError("a key doesn't exist")
+        def search_gen(map_, kds):
+            kd, *next_kds = kds
+            constraint = constraints.get(kd.name)
+            if constraint is None:
+                it = map_.values()
+            elif type(constraint) is slice:
+                if not kd.sliceable:
+                    raise TypeError("key is not a slicing type")
+                it = map_.islice(constraint.start, constraint.stop)
+            else:
+                if not isinstance(constraint, frozenset):
+                    constraint = (constraint,)
+                it = (map_[k] for k in constraint if k in map_)
+
+            if not next_kds:
+                yield from it
+            else:
+                for m in it:
+                    yield from search_gen(m, next_kds)
+
+        results = search_gen(self.maps, self.keydefs)
+        if self.unique:
+            return iter(sorted(results))
+        else:
+            return heapq.merge(*results)
+
+    def __iter__(self):
+        return self.iter_for({})
+
+
+
+class Query:
+    def __init__(self, queryable, constraints:dict={}):
+        self.queryable = queryable
+        self.constraints = constraints
+        self.ops = []
+
+    def _plus_op(self, op):
+        new = self.__class__(self.queryable, self.constraints)
+        new.ops = self.ops.copy()
+        new.ops.append(op)
+        return new
+
+    def _filter_impl(self, iterator, f):
+        return filter(f, iterator)
+
+    def _join_impl(self, iterator, other_query):
+        end = object()
+        iters = (iterator, iter(other_query))
+        values = [next(iters[0]), next(iters[1])]
+        try:
+            while end not in values:
+                if values[0] == values[1]:
+                    yield values[0]
+                    values = [next(it, end) for it in iters]
+                else:
+                    adv_i = int(iters[1] < iters[0])
+                    values[adv_i] = next(iters[adv_i])
+            yield [x for x in values if x is not end]
+        except StopIteration:
+            pass
+        yield from iters[0]
+        yield from iters[1]
+
+    def filter(self, f):
+        return self._plus_op((self._filter_impl, f))
+
+    def join(self, other_query):
+        return self._plus_op((self._join_impl, other_query))
+
+    def _keys_iter(self):
+        it = self.queryable.iter_with_constraints(self.constraints)
+        for func, *args in self.ops:
+            it = func(it, *args)
+        return it
+
+    def one(self):
+        r = list(islice(self._keys_iter(), 2))
+        if len(r) != 1:
+            raise ValueError("Result set is not exactly one element.")
+        return self.queryable.mapper[r[0]]
+
+    def __iter__(self):
+        return (self.queryable.mapper[k] for k in self._keys_iter())
 
 
 
