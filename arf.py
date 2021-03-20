@@ -6,9 +6,9 @@
 import sys
 assert (sys.version_info.major, sys.version_info.minor) >= (3, 7)
 
+import collections.abc, io, heapq, itertools, weakref, random
 from itertools import islice
 from dataclasses import dataclass
-import collections.abc, io, heapq, weakref
 
 # local imports
 import selfdelimitedblob
@@ -171,7 +171,7 @@ class unit_metaclass(type):
                 raise ValueError("Unit definition has conflicting data labels")
             ds.extend(add_dds.values())
             pns.update((name,i) for i,name in enumerate(add_dds, base_len))
-        
+
         attrs['data_spec'] = ds
         attrs['piece_names'] = pns
         new_cls = super(unit_metaclass, cls).__new__(cls, name, bases, attrs)
@@ -193,14 +193,14 @@ class UnitBase(metaclass=unit_metaclass):
     def __init__(self, *pieces):
         if len(pieces) != len(self.data_spec):
             raise UnitDataFormatError("Wrong number of pieces")
-        self.pieces = pieces
+        self.pieces = tuple(pieces)
         self.__class__._validate(self)
 
     @classmethod
     def _validate(cls, v):
         if not type(v) is cls:
             raise TypeError()
-        for dt,pn,p in zip(self.data_spec, self.piece_names, pieces):
+        for dt,pn,p in zip(self.data_spec, self.piece_names, self.pieces):
             try: dt.validate(p)
             except TypeError: raise UnitDataFormatError(f"failed validation of {pn}")
 
@@ -211,6 +211,12 @@ class UnitBase(metaclass=unit_metaclass):
         pcs = repr(tuple(self.pieces))
         return f"<{self.__class__.__name__} {id(self)}" \
                f" {pcs[:50]+(pcs[50:] or ' ...')}>"
+
+    def __eq__(self, other):
+        return type(self) == type(other) and self.pieces == other.pieces
+
+    def __hash__(self):
+        return hash(self.pieces)
 
 class Unit(UnitBase):
     additional_data_defs = {'typeid':UnitTypeID}
@@ -296,6 +302,10 @@ class ARFSpec():
     def __repr__(self):
         return f"<{self.__class__.__name__} {id(self)} ({self._listing})>"
 
+    def new(self, ut, *args, **kwargs):
+        typeid = self.reverse_lookup(ut)
+        return ut(typeid, *args, **kwargs)
+
 base_spec = ARFSpec()
 
 # Built-in Unit types
@@ -309,8 +319,8 @@ class TxScopeMarker(Unit):
 
 @base_spec.register(3)
 class TxScopeFinalize(Unit):
-    additional_data_defs = {'release-or-commit': Bool}
-    cached = 'release-or-commit'
+    additional_data_defs = {'is-commit': Bool}
+    cached = 'is-commit'
     grammar = 'MODIFIER'
     scope = 'TX'
     persistence = 'ELAPSING'
@@ -332,6 +342,29 @@ class StrandGroupSelect(Unit):
     scope = 'TX'
     persistence = 'REFRESHING'
 
+    def to_range(self):
+        id = self['strd-group']
+        mask = StrandGroupMagnitude.to_strand_group_mask(self['strd-group-mag'])
+        start = id & ~mask
+        stop = (id | mask) + 1
+        return range(start, stop)
+
+class StrandCompositeSelection:
+    def __init__(self, *select_mods):
+        self.singles = DenseIntegerSet()
+        self.containers = [self.singles]
+        for m in select_mods:
+            self.add(m)
+
+    def add(self, select_mod):
+        if isinstance(select_mod, StrandSelect):
+            self.singles.add(select_mod['strd-id'])
+        elif isinstance(select_mod, StrandGroupSelect):
+            self.containers.append(select_mod.to_range())
+
+    def __contains__(self, strand_id):
+        return any(strand_id in c for c in reversed(self.containers))
+
 @base_spec.register(6)
 class StrandWriteDataBlock(Unit):
     additional_data_defs = {'offset': StrandSize, 'data': StrandData}
@@ -339,18 +372,20 @@ class StrandWriteDataBlock(Unit):
     grammar = 'SUBJECT'
     scope = 'TX'
     persistence = 'REFRESHING'
+    differentiators = ('offset', StrandSelect)
 
 @base_spec.register(7)
-class StrandCreateUpdate(Unit):
+class StrandCreate(Unit):
     additional_data_defs = {'strd-size-bytes': StrandSize}
     cached = 'strd-size-bytes'
     grammar = 'SUBJECT'
     scope = 'TX'
     persistence = 'REFRESHING'
+    differentiators = (StrandSelect,)
 
 @base_spec.register(8)
 class StrandDiscard(Unit):
-    additional_data_defs = {'strd-group-member-sub-id-sz-bits': UnitTypeID}
+    additional_data_defs = {}
     grammar ='SUBJECT'
     scope ='TX'
     persistence = 'ELAPSING'
@@ -657,19 +692,28 @@ class ARFMapper(Queryable):
         self._sync_gen = _sync_gen_func()
 
     def _unit_valid_test(self, store_id):
-        return store_id in self.mapper.storage
+        return store_id in self.storage
 
     def _map_unit(self, store_id, ut):
         assert ut.scope == 'GLOBAL' or self.cur_txscope is not None
-        info = self.UnitInfo(store_id, ut, self.cur_txscope,
-                             self.mod_next_ids_per_txs[None],
-                             self.mod_next_ids_per_txs[self.cur_txscope])
-        self.units[store_id] = info
+        ui = self.UnitInfo(store_id, ut, self.cur_txscope,
+                           self.mod_next_ids_per_txs[None],
+                           self.mod_next_ids_per_txs[self.cur_txscope])
+        self.units[store_id] = ui
 
-        if ut.grammar == 'MODIFIER':
+        mod_nexts:list = self.mod_next_ids_per_txs[ui['txs']]
+        if ut is TxScopeMarker:
+            prev_txs, next_txs = self.storage.read(
+                store_id, select=['prev-txs','next-txs'])
+            assert prev_txs == self.cur_txscope
+            self.cur_txscope = next_txs
+        elif ut is TxScopeFinalize:
+            for mod_i in range(len(mod_nexts)):
+                mod_nexts[mod_i] += 1
+        elif ut.grammar == 'MODIFIER':
             mod_i = self.ut_listing.txs_mods.index(ut) if ut.scope == 'TX' \
                     else self.ut_listing.glob_mods.index(ut)
-            self.mod_next_ids_per_txs[info['txs']][mod_i] += 1
+            mod_nexts[mod_i] += 1
 
     def _sync_gen_func(self):
         read_it = lambda st: self.storage.multi_read_iter(st, select=['typeid'])
@@ -768,7 +812,7 @@ class ARFMapperIndex(Queryable):
     def __init__(self, *keydefs, unique=False, selector=None, mapper:ARFMapper):
         self.keydefs = keydefs
         self.unique = unique
-        self.selector = selector
+        self.selector = selector or (lambda x: True)
         self.mapper = mapper
 
         def map_factory_for(keydef_i=0):
@@ -787,29 +831,43 @@ class ARFMapperIndex(Queryable):
                 return lambda: uniq_cls(test)
             return lambda: cont_cls(lambda: PerishablesSet(test))
 
-        self.maps = map_factory_for() # fails if no keydefs
-        self.feed = mapper.getfeed(recv_extend=self._recv_extend)
-        self._recv_extend()
-
-    def _recv_extend(self, _=None):
-        for info in self.feed.iter_new_units():
-            self.maybe_add_unit(info)
+        self.maps = map_factory_for()() # fails if no keydefs
 
     def maybe_add_unit(self, unit_info):
-        if (self.selector is not None) and (not self.selector(unit_info)):
-            return
+        assert unit_info.mapper is self.mapper
+        if self.selector(unit_info):
+            self._add_unit(unit_info)
 
+    def mapkey_for(self, unit_info):
         map_ = self.maps
         for kd in self.keydefs:
             k = unit_info[kd.name]
             if kd is not self.keydefs[-1]:
                 map_ = map_[k]
+        return map_, k
+
+    def _add_unit(self, unit_info):
+        map_, k = self.mapkey_for(unit_info)
 
         if self.unique:
             assert k not in map_
             map_[k] = unit_info['store_id']
         else:
             map_[k].add(unit_info['store_id'])
+
+    def discard_unit(self, unit_info):
+        map_, k = self.mapkey_for(unit_info)
+
+        if self.unique:
+            if k in map_:
+                if map_.try_release_expired():
+                    # k should still exist after try_release_expired. If not it
+                    # implies unit_info isn't valid because k isn't in storage.
+                    del map_[k]
+                else:
+                    raise RuntimeError(f"Can't delete {k}, map is locked.")
+        else:
+            map_.discard(k)
 
     def iter_with_constraints(self, constraints:dict={}):
         if not constraints.keys() <= set(kd.name for kd in self.keydefs):
@@ -841,12 +899,12 @@ class ARFMapperIndex(Queryable):
             return heapq.merge(*results)
 
     def __iter__(self):
-        return self.iter_for({})
+        return self.iter_with_constraints({})
 
 
 
 class Query:
-    def __init__(self, queryable, constraints:dict={}):
+    def __init__(self, queryable:Queryable, constraints:dict={}):
         self.queryable = queryable
         self.constraints = constraints
         self.ops = []
@@ -899,12 +957,131 @@ class Query:
     def __iter__(self):
         return (self.queryable.mapper[k] for k in self._keys_iter())
 
+    def exists(self):
+        return bool(list(islice(self._keys_iter(), 1)))
+
+    def count(self):
+        return sum(1 for _ in self._keys_iter())
+
+
+
+class OpenTXsIndex(ARFMapperIndex):
+    def __init__(self, mapper, export_commit):
+        super().__init__(K("txs"), K("type"), mapper=mapper)
+        self.export_commit = export_commit
+        self.active_scopes = collections.defaultdict(StrandCompositeSelection)
+
+    def maybe_add_unit(self, unit_info):
+        if not (unit_info["type"].scope == "TX" and
+                unit_info["type"].grammar in ('SUBJECT','MODIFIER')):
+            return
+
+        self._add_unit(unit_info)
+
+        txs = unit_info["txs"]
+        strand_selections = self.active_scopes[txs]
+
+        if unit_info["type"] in (StrandSelect, StrandGroupSelect):
+            strand_selections.add(unit_info[None])
+        elif unit_info["type"] is TxScopeFinalize:
+            del self.active_scopes[txs]
+            tx = collections.deque(Query(self, {"txs":txs}))
+            for ui in tx:
+                self.discard_unit(ui)
+            if unit_info["is_commit"]:
+                self.export_commit(tx)
+
+
+
+class ARFIndexer:
+    def __init__(self, unit_type_listing, storage):
+        self.mapper = mapper = ARFMapper(unit_type_listing, storage)
+
+        self.open_transactions = OpenTXsIndex(mapper, self._process_commit)
+        K = ARFMapperIndex.KeyDef
+        self.committed_subjects = ARFMapperIndex(K("type"), mapper=mapper)
+        self.committed_modifiers = ARFMapperIndex(
+            K(("txs","type","mod_id")),
+            unique=True, mapper=mapper)
+
+        self.feed = mapper.getfeed(recv_extend=self._recv_extend)
+        self.feed.notify_extend()
+
+    def _recv_extend(self, iterator):
+        for ui in iterator:
+            self.open_transactions.maybe_add_unit(ui)
+
+    def _process_commit(self, tx):
+        subjects = []
+        while tx:
+            ui = tx.popleft()
+            if ui["type"].grammar == 'SUBJECT':
+                subjects.append(ui)
+            elif ui["type"].grammar == 'MODIFIER':
+                self.committed_modifiers.maybe_add_unit(ui)
+            else:
+                assert False
+        del tx
+
+        raise NotImplementedError()
+
+
+
+class TransactionWriter:
+    def __init__(self, reader:ARFReader, new_units, txs:int=None):
+        self.reader = reader
+        self.new_units = self.sort_units_by_mod_group_size(new_units)
+
+        if txs is None:
+            try:
+                TxScopeID.validate(len(self.reader.mapper.active_txscopes) << 1)
+            except TypeError:
+                raise RuntimeError("Out of assignable transaction scope ids.")
+            while True:
+                txs = random.getrandbits(TxScopeID.bit_length)
+                if txs not in self.reader.mapper.active_txscopes:
+                    break
+        TxScopeID.validate(txs)
+        self.txs = txs
+
+    @staticmethod
+    def sort_units_by_mod_group_size(assoc_unit_groups):
+        for subj, *mods in assoc_unit_groups:
+            if not (u.grammar == 'SUBJECT' and \
+                    all(m.grammar == 'MODIFIER' for m in mods)):
+                raise TypeError()
+
+        r = []
+        while assoc_unit_groups:
+            mod_counts = collections.Counter()
+            for subj, *mods in assoc_unit_groups:
+                mod_counts.update(mods)
+            most_common = mod_counts.most_common(1)[0][0]
+
+            defered = []
+            for units in assoc_unit_groups:
+                l = r if (most_common in units) else defered
+                l.append(most_common)
+            assoc_unit_groups = defered
+        return r
+
+    def subjects_to_refresh(self):
+        # - subjects
+        # - "REFRESHING" type
+        # - committed
+        # - not occluded
+        # - exists (not expired), obviously
+        pass
+
 
 
 # Default Transit Handler
 
-class LoopbackTransitHandler:
-    def __init__(self, cache, **options):
+class TransitHandler:
+    pass
+
+class LoopbackTransitHandler(TransitHandler):
+    def __init__(self, storage):
         pass
 
     def send(self, units):
@@ -925,5 +1102,8 @@ class ARFManager:
 
     def e(self) -> io.BytesIO:
         pass
+
+class ARFObject:
+    pass
 
 print("hi")
