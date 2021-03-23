@@ -134,9 +134,13 @@ class AutoContainerMapMixin(AutoContainerMapInterfaceMixin, PerishablesMapMixin)
 
 
 
-class UserSet(collections.abc.MutableSet):
+class OrderedSet(collections.abc.MutableSet):
+    __slots__ = ("data","last_add")
+
     def __init__(self, iterable=()):
-        self.data = set(iterable)
+        self.data = {}
+        for k in iterable:
+            self.add(k)
 
     def __contains__(self, k):
         return k in self.data
@@ -148,19 +152,21 @@ class UserSet(collections.abc.MutableSet):
         return len(self.data)
 
     def add(self, k):
-        self.data.add(k)
+        self.data[k] = None
+        self.last_add = k
 
     def discard(self, k):
-        self.data.discard(k)
+        self.data.pop(k, None)
 
     def __repr__(self):
-        return repr(self.data)
+        c = f"<{self.__class__.__module__}.{self.__class__.__qualname__}"
+        return f"<{c} {list(self.data)}>"
 
 
 
 # Prebuilts
 
-class PerishablesSet(PerishablesSetMixin, UserSet):
+class PerishablesSet(PerishablesSetMixin, OrderedSet):
     pass
 
 class PerishablesMap(PerishablesMapMixin, collections.UserDict):
@@ -176,7 +182,8 @@ class PerishablesSearchTreeMap(PerishablesMapMixin, SearchTreeMap):
     def _getsliceview(self, ksslice):
         return PerishablesSearchTreeMapSliceView(self, ksslice)
 
-class AutoContainerMap(AutoContainerMapMixin, collections.UserDict)
+class AutoContainerMap(AutoContainerMapMixin, collections.UserDict):
+    pass
 
 class AutoContainerSearchTreeMapSliceView(AutoContainerMapInterfaceMixin,
                                           PerishablesSearchTreeMapSliceView):

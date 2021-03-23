@@ -14,7 +14,8 @@ class Node:
 
     def __repr__(self):
         cks = [getattr(c,'k',None) for c in self.children]
-        return f"<{__name__}.{self.__class__.__qualname__} ({self.k}) {cks}>"
+        return f"<{self.__class__.__module__}.{self.__class__.__qualname__} " \
+               f"({self.k}) {cks}>"
 
 
 
