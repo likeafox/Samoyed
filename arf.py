@@ -333,6 +333,10 @@ class StrandSelect(Unit):
     scope = 'TX'
     persistence = 'REFRESHING'
 
+    # def to_range(self):
+    #     id = self['strd-id']
+    #     return range(id, id+1)
+
 @base_spec.register(5)
 class StrandGroupSelect(Unit):
     additional_data_defs = {'strd-group': StrandID,
@@ -372,7 +376,7 @@ class StrandWriteDataBlock(Unit):
     grammar = 'SUBJECT'
     scope = 'TX'
     persistence = 'REFRESHING'
-    differentiators = ('offset', StrandSelect)
+    strand_selector = StrandSelect
 
 @base_spec.register(7)
 class StrandCreate(Unit):
@@ -381,7 +385,7 @@ class StrandCreate(Unit):
     grammar = 'SUBJECT'
     scope = 'TX'
     persistence = 'REFRESHING'
-    differentiators = (StrandSelect,)
+    strand_selector = StrandSelect
 
 @base_spec.register(8)
 class StrandDiscard(Unit):
@@ -389,6 +393,7 @@ class StrandDiscard(Unit):
     grammar ='SUBJECT'
     scope ='TX'
     persistence = 'ELAPSING'
+    strand_selector = StrandGroupSelect
 
 
 
@@ -534,14 +539,17 @@ class ARFMapper(Queryable):
                         modifier of the applicable type. This can also return valid ids
                         for future modifiers that don't exist yet.
             "mod_id" :  If the unit is a modifier, return its modifier id.
-            None :      Do a full read from storage to return the Unit itself.
             <Piece index or name> : The unit piece's value. Reads from storage if the
                         value is not cached.
-            <tuple of other non-None `k` values> : a tuple containing results
+            None :      Return the Unit itself, reading from storage if necessary.
+            <tuple of other non-None `k` values> : A tuple containing results
                         corresponding to each key.
             """
             if k is None:
-                return self.mapper.storage.read(self.store_id, select=[])
+                ut = self.unit_type
+                recursing_k = tuple(range(len(ut.data_spec)))
+                return ut(self[recursing_k])
+
             multi = type(k) is tuple
             ks = k if multi else (k,)
 
@@ -809,11 +817,12 @@ class ARFMapperIndex(Queryable):
     class UniquesMap(UniquesMapMixin, PerishablesMap): pass
     class UniquesSearchTreeMap(UniquesMapMixin, PerishablesSearchTreeMap): pass
 
-    def __init__(self, *keydefs, unique=False, selector=None, mapper:ARFMapper):
+    def __init__(self, keydefs, unique=False, selector=None, mapper:ARFMapper):
         self.keydefs = keydefs
         self.unique = unique
         self.selector = selector or (lambda x: True)
         self.mapper = mapper
+        self.well_sorted = True
 
         def map_factory_for(keydef_i=0):
             keydef = keydefs[keydef_i]
@@ -848,12 +857,15 @@ class ARFMapperIndex(Queryable):
 
     def _add_unit(self, unit_info):
         map_, k = self.mapkey_for(unit_info)
+        store_id = unit_info['store_id']
 
         if self.unique:
             assert k not in map_
-            map_[k] = unit_info['store_id']
+            map_[k] = store_id
         else:
-            map_[k].add(unit_info['store_id'])
+            if store_id < getattr(map_[k], "last_add", -1):
+                self.well_sorted = False
+            map_[k].add(store_id)
 
     def discard_unit(self, unit_info):
         map_, k = self.mapkey_for(unit_info)
@@ -896,7 +908,10 @@ class ARFMapperIndex(Queryable):
         if self.unique:
             return iter(sorted(results))
         else:
-            return heapq.merge(*results)
+            if self.well_sorted:
+                return heapq.merge(*results)
+            else:
+                return iter(sorted(itertools.chain(*results)))
 
     def __iter__(self):
         return self.iter_with_constraints({})
@@ -919,22 +934,15 @@ class Query:
         return filter(f, iterator)
 
     def _join_impl(self, iterator, other_query):
-        end = object()
-        iters = (iterator, iter(other_query))
-        values = [next(iters[0]), next(iters[1])]
+        it = (iterator, iter(other_query))
         try:
-            while end not in values:
-                if values[0] == values[1]:
-                    yield values[0]
-                    values = [next(it, end) for it in iters]
-                else:
-                    adv_i = int(iters[1] < iters[0])
-                    values[adv_i] = next(iters[adv_i])
-            yield [x for x in values if x is not end]
+            v = [next(it[0]), next(it[1])]
+            while True:
+                s = v[1]<v[0], v[0]<v[1]
+                if s == (0,0): yield v[0]
+                for i in (0,1): v[i] = v[i] if s[i] else next(it[i])
         except StopIteration:
             pass
-        yield from iters[0]
-        yield from iters[1]
 
     def filter(self, f):
         return self._plus_op((self._filter_impl, f))
@@ -951,7 +959,7 @@ class Query:
     def one(self):
         r = list(islice(self._keys_iter(), 2))
         if len(r) != 1:
-            raise ValueError("Result set is not exactly one element.")
+            raise LookupError("Result set is not exactly one element.")
         return self.queryable.mapper[r[0]]
 
     def __iter__(self):
@@ -965,9 +973,161 @@ class Query:
 
 
 
+class SubjectWithContext:
+    def __init__(self, subj:ARFMapper.UnitInfo, mods:Query, strict=True):
+        self.subj = subj
+        ut = self.unit_type = subj["type"]
+
+        if subj.mapper != mods.queryable.mapper:
+            raise TypeError()
+        if ut.grammar != 'SUBJECT':
+            raise TypeError()
+
+        self.mods = {}
+        for m in mods:
+            if m["type"].grammar != 'MODIFIER':
+                if strict:
+                    raise TypeError("Not all units in `mods` are modifiers.")
+                else:
+                    continue
+            if not (subj["txs"] == m["txs"] and
+                    subj[m["type"]] == m["mod_id"]):
+                if strict:
+                    raise ValueError("A modifier doesn't affect the subject.")
+                else:
+                    continue
+            self.mods[m["type"]] = m
+
+        if getattr(ut,"strand_selector",None) == StrandSelect:
+            self.strand = self.mods[StrandSelect]['strd-id']
+        if ut is StrandDiscard:
+            self.discard_strands = self.mods[StrandGroupSelect][None].to_range()
+
+    def __getitem__(self, k):
+        return self.subj[k]
+
+
+
+class OcclusionTests:
+    def __init__(self):
+        self.tests = []
+
+    def copy(self):
+        obj = self.__class__()
+        obj.tests = self.tests.copy()
+        return obj
+
+    def register(self, rear_type, fore_type):
+        def d(func):
+            self.tests.append(((rear_type, fore_type), func))
+            return func
+        return d
+
+    def __getitem__(self, k):
+        rear_type, fore_type = k
+        funcs = []
+        for (rt,ft),func in self.tests:
+            if (issubclass(rear_type,rt) and issubclass(fore_type,ft)):
+                funcs.append(func)
+        def test(rear_subj, fore_subj):
+            return any(f(rear_subj, fore_subj) for f in funcs)
+        return test
+
+@call
+def occlusion_tests():
+    tests = OcclusionTests()
+    reg = tests.register
+
+    @reg(StrandDiscard, object)
+    def t(rear, fore):
+        return True
+
+    @reg(StrandCreate,         StrandDiscard)
+    @reg(StrandWriteDataBlock, StrandDiscard)
+    def t(rear, fore):
+        return rear.strand in fore.discard_strands
+
+    @reg(StrandWriteDataBlock, StrandWriteDataBlock)
+    def t(rear, fore):
+        return rear["offset"] == fore["offset"] and \
+               rear.strand == fore.strand
+
+    @reg(StrandCreate, StrandCreate)
+    def t(rear, fore):
+        return rear.strand == fore.strand
+
+    @reg(StrandWriteDataBlock, StrandCreate)
+    def t(rear, fore):
+        return rear.strand == fore.strand and \
+               rear["offset"] <= fore["strd-size-bytes"]
+
+    return tests
+
+
+
+class Content:
+    def __init__(self, unit_infos=(), mapper:ARFMapper=None):
+        try:
+            self.mapper = mapper or (unit_infos.queryable.mapper if \
+                hasattr(unit_infos, "queryable") else \
+                next(iter(unit_infos)).mapper)
+        except StopIteration:
+            raise TypeError("Can't determine mapper for Content")
+        self._make_indexes()
+        for ui in unit_infos:
+            self.add_unit(ui)
+
+    def _make_indexes(self):
+        K = ARFMapperIndex.KeyDef
+        # For Content's primary uses, units will be coming in out of
+        # chronological order, as transactions are only applied when actually
+        # committed. Therefore every ARFMapperIndex should be keyed with "txs"
+        # so that each subcontainer remains "well-sorted", which improves
+        # efficiency of querying results.
+        self.subjects = ARFMapperIndex([K("type"), K("txs")], mapper=self.mapper)
+        self.modifiers = ARFMapperIndex([K(("txs","type","mod_id"))], unique=True)
+
+    def add_unit(self, unit_info):
+        try:
+            index = {'SUBJECT': self.subjects,
+                     'MODIFIER': self.modifiers}[unit_info["type"].grammar]
+        except KeyError:
+            raise TypeError()
+        index.maybe_add_unit(ui)
+
+    def _context_for(self, subj:ARFMapper.UnitInfo):
+        is_tx = subj["type"].scope == 'TX'
+        mod_types = self.mapper.ut_listing.all_mods if is_tx else \
+                    self.mapper.ut_listing.glob_mods
+        mod_index_ks = frozenset((subj[txs], mt, subj[mt]) for mt in mod_types)
+        q = Query(self.modifiers, {("txs","type","mod_id"):mod_index_ks})
+        return SubjectWithContext(subj, q)
+
+    def __iter__(self):
+        return (self._context_for(ui) for ui in self.subjects)
+
+    def calc_occlusions(self, outside_subj:SubjectWithContext):
+        results = DenseIntegerSet()
+
+        subj_types = {StrandWriteDataBlock, StrandCreate, StrandDiscard}
+        assert self.subjects.maps.keys() <= subj_types < self.mapper.ut_listing.unit_types
+
+        for st in subj_types:
+            test = occlusion_tests[st, outside_subj["type"]]
+            q = Query(self.subjects, {"type": st})
+            for ui in q:
+                subj = self._context_for(ui)
+                if test(subj, outside_subj):
+                    store_id = subj["store_id"]
+                    if store_id not in results:
+                        yield store_id
+                        results.add(store_id)
+
+
+
 class OpenTXsIndex(ARFMapperIndex):
     def __init__(self, mapper, export_commit):
-        super().__init__(K("txs"), K("type"), mapper=mapper)
+        super().__init__([K("txs"), K("type")], mapper=mapper)
         self.export_commit = export_commit
         self.active_scopes = collections.defaultdict(StrandCompositeSelection)
 
@@ -985,7 +1145,7 @@ class OpenTXsIndex(ARFMapperIndex):
             strand_selections.add(unit_info[None])
         elif unit_info["type"] is TxScopeFinalize:
             del self.active_scopes[txs]
-            tx = collections.deque(Query(self, {"txs":txs}))
+            tx = Query(self, {"txs":txs})
             for ui in tx:
                 self.discard_unit(ui)
             if unit_info["is_commit"]:
@@ -998,6 +1158,8 @@ class ARFIndexer:
         self.mapper = mapper = ARFMapper(unit_type_listing, storage)
 
         self.open_transactions = OpenTXsIndex(mapper, self._process_commit)
+
+        # todo: don't do this:
         K = ARFMapperIndex.KeyDef
         self.committed_subjects = ARFMapperIndex(K("type"), mapper=mapper)
         self.committed_modifiers = ARFMapperIndex(
@@ -1027,7 +1189,7 @@ class ARFIndexer:
 
 
 
-class TransactionWriter:
+class TransactionAuthor:
     def __init__(self, reader:ARFReader, new_units, txs:int=None):
         self.reader = reader
         self.new_units = self.sort_units_by_mod_group_size(new_units)
