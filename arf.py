@@ -807,7 +807,7 @@ class ARFMapper(Queryable):
 class ARFMapperIndex(Queryable):
     @dataclass
     class KeyDef:
-        name: str
+        name: collections.abc.Hashable
         sliceable: bool = False
 
     class UniquesMapMixin:
@@ -817,7 +817,7 @@ class ARFMapperIndex(Queryable):
     class UniquesMap(UniquesMapMixin, PerishablesMap): pass
     class UniquesSearchTreeMap(UniquesMapMixin, PerishablesSearchTreeMap): pass
 
-    def __init__(self, keydefs, unique=False, selector=None, mapper:ARFMapper):
+    def __init__(self, keydefs, mapper:ARFMapper, unique=False, selector=None):
         self.keydefs = keydefs
         self.unique = unique
         self.selector = selector or (lambda x: True)
@@ -916,6 +916,26 @@ class ARFMapperIndex(Queryable):
     def __iter__(self):
         return self.iter_with_constraints({})
 
+    def unique_keys_on(self, keydef_name):
+        for i,kd in enumerate(self.keydefs):
+            if kd.name == keydef_name:
+                on_keydef_i = i
+        else:
+            raise KeyError("Index doesn't have a keydef by that name")
+
+        def k_gen(map_=self.maps, kd_i=0):
+            if kd_i == on_keydef_i:
+                yield from map_.keys()
+            else:
+                for m in map_.values():
+                    yield from search_gen(m, kd_i+1)
+
+        results = set()
+        for k in k_gen():
+            if k not in results:
+                yield k
+            results.add(k)
+
 
 
 class Query:
@@ -930,7 +950,7 @@ class Query:
         new.ops.append(op)
         return new
 
-    def _filter_impl(self, iterator, f):
+    def _filter_ids_impl(self, iterator, f):
         return filter(f, iterator)
 
     def _join_impl(self, iterator, other_query):
@@ -944,11 +964,21 @@ class Query:
         except StopIteration:
             pass
 
-    def filter(self, f):
-        return self._plus_op((self._filter_impl, f))
+    def _merge_impl(self, iterator, other_queries):
+        prev = object()
+        for id_ in heapq.merge(iterator, *other_queries):
+            if id_ != prev:
+                yield id_
+            prev = id_
+
+    def filter_ids(self, f):
+        return self._plus_op((self._filter_ids_impl, f))
 
     def join(self, other_query):
         return self._plus_op((self._join_impl, other_query))
+
+    def merge(self, *other_queries):
+        return self._plus_op((self._merge_impl, other_queries))
 
     def _keys_iter(self):
         it = self.queryable.iter_with_constraints(self.constraints)
@@ -998,8 +1028,16 @@ class SubjectWithContext:
                     continue
             self.mods[m["type"]] = m
 
+        if ut.scope == 'TX':
+            finalize = self.mods[TxScopeFinalize]
+            if not finalize["is-commit"]:
+                raise ValueError("Subject can't have context because it is discarded")
+            self.content_order = finalize["store_id"]
+        elif ut.scope == 'GLOBAL':
+            self.content_order = subj["store_id"]
+
         if getattr(ut,"strand_selector",None) == StrandSelect:
-            self.strand = self.mods[StrandSelect]['strd-id']
+            self.strand = self.mods[StrandSelect]["strd-id"]
         if ut is StrandDiscard:
             self.discard_strands = self.mods[StrandGroupSelect][None].to_range()
 
@@ -1011,6 +1049,7 @@ class SubjectWithContext:
 class OcclusionTests:
     def __init__(self):
         self.tests = []
+        self.types_included = set()
 
     def copy(self):
         obj = self.__class__()
@@ -1018,8 +1057,12 @@ class OcclusionTests:
         return obj
 
     def register(self, rear_type, fore_type):
+        types = (rear_type, fore_type)
         def d(func):
-            self.tests.append(((rear_type, fore_type), func))
+            self.tests.append((types, func))
+            for t in types:
+                if t is not object:
+                    self.types_included.add(t)
             return func
         return d
 
@@ -1075,7 +1118,12 @@ class Content:
             raise TypeError("Can't determine mapper for Content")
         self._make_indexes()
         for ui in unit_infos:
-            self.add_unit(ui)
+            self._add_unit(ui)
+
+        # Test for occlusions, but in addition, this has the side-effect of
+        # validating all subjects, by calling _context_for() for each.
+        for _ in self.calc_occlusions(self):
+            raise ValueError("Can't create Content with conflicting subjects")
 
     def _make_indexes(self):
         K = ARFMapperIndex.KeyDef
@@ -1084,13 +1132,14 @@ class Content:
         # committed. Therefore every ARFMapperIndex should be keyed with "txs"
         # so that each subcontainer remains "well-sorted", which improves
         # efficiency of querying results.
-        self.subjects = ARFMapperIndex([K("type"), K("txs")], mapper=self.mapper)
-        self.modifiers = ARFMapperIndex([K(("txs","type","mod_id"))], unique=True)
+        self.subjects = ARFMapperIndex([K("txs"), K("type")], self.mapper)
+        self.modifiers = ARFMapperIndex([K(("txs","type","mod_id"))],
+                                        mapper=self.mapper, unique=True)
+        self.indexes = {'SUBJECT': self.subjects, 'MODIFIER': self.modifiers}
 
-    def add_unit(self, unit_info):
+    def _add_unit(self, unit_info):
         try:
-            index = {'SUBJECT': self.subjects,
-                     'MODIFIER': self.modifiers}[unit_info["type"].grammar]
+            index = self.indexes[unit_info["type"].grammar]
         except KeyError:
             raise TypeError()
         index.maybe_add_unit(ui)
@@ -1104,33 +1153,78 @@ class Content:
         return SubjectWithContext(subj, q)
 
     def __iter__(self):
-        return (self._context_for(ui) for ui in self.subjects)
+        """Returns all subjects as SubjectWithContexts, in content order."""
+        def txs_gen(txs):
+            for ui in Query(self.subjects, {"txs": txs}):
+                yield self._context_for(ui)
+        its = (txs_gen(txs) for txs in self.subjects.unique_keys_on("txs"))
+        return heapq.merge(*its, lambda subj: subj.content_order)
 
-    def calc_occlusions(self, outside_subj:SubjectWithContext):
-        results = DenseIntegerSet()
+    def calc_occlusions(self, fore):
+        """Compare `fore` against each subject in this Content, returning the
+        store_id of all subjects which are occluded by fore. `fore` can be
+        either a SubjectWithContext, or a Context containing any number of
+        subjects. When a fore-subject is contained in this Context as well, this
+        function will not test against subjects that occur after the
+        fore-subject in the content order. ie.: for a given fore-subject, this
+        function only tests subjects that are actually considered to be "behind"
+        the fore-subject)."""
+        assert set(self.subjects.unique_keys_on("type")) \
+               <= occlusion_tests.types_included \
+               < self.mapper.ut_listing.unit_types
 
-        subj_types = {StrandWriteDataBlock, StrandCreate, StrandDiscard}
-        assert self.subjects.maps.keys() <= subj_types < self.mapper.ut_listing.unit_types
+        if isinstance(fore, SubjectWithContext):
+            yield from self._calc_occlusions_single(fore)
+        else:
+            results = DenseIntegerSet()
+            for fore_subj in fore:
+                for occ in self._calc_occlusions_single(fore_subj, results):
+                    if occ not in results:
+                        yield occ
+                        results.add(occ)
 
-        for st in subj_types:
-            test = occlusion_tests[st, outside_subj["type"]]
-            q = Query(self.subjects, {"type": st})
-            for ui in q:
-                subj = self._context_for(ui)
-                if test(subj, outside_subj):
-                    store_id = subj["store_id"]
-                    if store_id not in results:
-                        yield store_id
-                        results.add(store_id)
+    def _calc_occlusions_single(self, fore_subj:SubjectWithContext):
+        tests = {t:occlusion_tests[t, fore_subj["type"]] for t in
+                 occlusion_tests.types_included}
+
+        for rear_subj in iter(self):
+            if rear_subj["store_id"] == fore_subj["store_id"]:
+                return
+            if tests[rear_subj["type"]](rear_subj, fore_subj):
+                yield rear_subj["store_id"]
+
+    def calc_unused_mods(self):
+        # Super low-effort implementation, could be made more efficient if needed
+        unused_mods = DenseIntegerSet(self.modifiers)
+        for subj in iter(self):
+            for mod in subj.mods.values():
+                unused_mods.remove(mod["store_id"])
+        return unused_mods
+
+    def merge_in(self, other):
+        if other.mapper != self.mapper:
+            raise ValueError("Can only merge Contents that share a mapper/storage.")
+        # Remove occluded, obsolete units
+        subjects_to_remove = DenseIntegerSet(self.calc_occlusions(other))
+        if subjects_to_remove:
+            discard = self.mapper.storage.discard
+            for id_ in subjects_to_remove:
+                discard(id_)
+            for id_ in calc_unused_mods():
+                discard(id_)
+        # Now add new
+        it = itertools.chain(Query(other.subjects), Query(other.modifiers))
+        for ui in it:
+            self._add_unit(ui)
 
 
 
 class OpenTXsIndex(ARFMapperIndex):
     def __init__(self, mapper, export_commit):
-        super().__init__([K("txs"), K("type")], mapper=mapper)
+        super().__init__([K("txs"), K("type")], mapper)
         self.export_commit = export_commit
         self.active_scopes = collections.defaultdict(StrandCompositeSelection)
-
+ 
     def maybe_add_unit(self, unit_info):
         if not (unit_info["type"].scope == "TX" and
                 unit_info["type"].grammar in ('SUBJECT','MODIFIER')):
@@ -1138,18 +1232,21 @@ class OpenTXsIndex(ARFMapperIndex):
 
         self._add_unit(unit_info)
 
+        if ut.scope != 'TX':
+            return
+
         txs = unit_info["txs"]
         strand_selections = self.active_scopes[txs]
 
-        if unit_info["type"] in (StrandSelect, StrandGroupSelect):
+        if ut in (StrandSelect, StrandGroupSelect):
             strand_selections.add(unit_info[None])
-        elif unit_info["type"] is TxScopeFinalize:
+        elif ut is TxScopeFinalize:
             del self.active_scopes[txs]
-            tx = Query(self, {"txs":txs})
-            for ui in tx:
+            tx_uis = list(Query(self, {"txs":txs}))
+            for ui in tx_uis:
                 self.discard_unit(ui)
             if unit_info["is_commit"]:
-                self.export_commit(tx)
+                self.export_commit(Content(tx_uis))
 
 
 
@@ -1157,35 +1254,23 @@ class ARFIndexer:
     def __init__(self, unit_type_listing, storage):
         self.mapper = mapper = ARFMapper(unit_type_listing, storage)
 
-        self.open_transactions = OpenTXsIndex(mapper, self._process_commit)
-
-        # todo: don't do this:
-        K = ARFMapperIndex.KeyDef
-        self.committed_subjects = ARFMapperIndex(K("type"), mapper=mapper)
-        self.committed_modifiers = ARFMapperIndex(
-            K(("txs","type","mod_id")),
-            unique=True, mapper=mapper)
+        self.globals = Content(mapper=mapper)
+        self.committed = Content(mapper=mapper)
+        self.open_transactions = OpenTXsIndex(mapper, self.committed.merge_in)
 
         self.feed = mapper.getfeed(recv_extend=self._recv_extend)
         self.feed.notify_extend()
 
     def _recv_extend(self, iterator):
         for ui in iterator:
+            ut = ui["type"]
+            if ut.scope == 'GLOBAL' and ut.grammar in ('SUBJECT','MODIFIER')):
+                content = Content((ui,))
+                self.globals.merge_in(content)
+                if ut.grammar == 'MODIFIER':
+                    self.committed.merge_in(content)
+
             self.open_transactions.maybe_add_unit(ui)
-
-    def _process_commit(self, tx):
-        subjects = []
-        while tx:
-            ui = tx.popleft()
-            if ui["type"].grammar == 'SUBJECT':
-                subjects.append(ui)
-            elif ui["type"].grammar == 'MODIFIER':
-                self.committed_modifiers.maybe_add_unit(ui)
-            else:
-                assert False
-        del tx
-
-        raise NotImplementedError()
 
 
 
