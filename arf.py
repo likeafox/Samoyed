@@ -73,6 +73,9 @@ class StrandID(UInt):
 class StrandSize(UInt):
     bit_length = 64
 
+class UInt128(UInt):
+    bits = 128
+
 class RangedUInt(UInt):
     @classmethod
     def byte_length(cls):
@@ -394,6 +397,10 @@ class StrandDiscard(Unit):
     scope ='TX'
     persistence = 'ELAPSING'
     strand_selector = StrandGroupSelect
+
+@base_spec.register(16)
+class FrameMeta(Unit):
+    additional_data_defs = {'stream-offset': UInt128}
 
 
 
@@ -1141,7 +1148,7 @@ class Content:
         try:
             index = self.indexes[unit_info["type"].grammar]
         except KeyError:
-            raise TypeError()
+            raise TypeError("Tried to add a non-content type")
         index.maybe_add_unit(ui)
 
     def _context_for(self, subj:ARFMapper.UnitInfo):
@@ -1159,6 +1166,9 @@ class Content:
                 yield self._context_for(ui)
         its = (txs_gen(txs) for txs in self.subjects.unique_keys_on("txs"))
         return heapq.merge(*its, lambda subj: subj.content_order)
+
+    def iter_stream_order(self):
+        return (self._context_for(s) for s in Query(self.subjects))
 
     def calc_occlusions(self, fore):
         """Compare `fore` against each subject in this Content, returning the
@@ -1263,62 +1273,56 @@ class ARFIndexer:
 
     def _recv_extend(self, iterator):
         for ui in iterator:
-            ut = ui["type"]
-            if ut.scope == 'GLOBAL' and ut.grammar in ('SUBJECT','MODIFIER')):
-                content = Content((ui,))
-                self.globals.merge_in(content)
-                if ut.grammar == 'MODIFIER':
-                    self.committed.merge_in(content)
+            self._add_unit(ui)
 
-            self.open_transactions.maybe_add_unit(ui)
+    def _add_unit(self, ui:ARFMapper.UnitInfo):
+        ut = ui["type"]
+        if ut.scope == 'GLOBAL' and ut.grammar in ('SUBJECT','MODIFIER')):
+            content = Content((ui,))
+            self.globals.merge_in(content)
+            if ut.grammar == 'MODIFIER':
+                self.committed.merge_in(content)
+
+        self.open_transactions.maybe_add_unit(ui)
 
 
 
-class TransactionAuthor:
-    def __init__(self, reader:ARFReader, new_units, txs:int=None):
-        self.reader = reader
-        self.new_units = self.sort_units_by_mod_group_size(new_units)
+class TransactionComposer:
+    def __init__(self, indexer:ARFIndexer, new_units, txs:int=None):
+        self.indexer = indexer
 
+        self._made_txses = set()
         if txs is None:
-            try:
-                TxScopeID.validate(len(self.reader.mapper.active_txscopes) << 1)
-            except TypeError:
-                raise RuntimeError("Out of assignable transaction scope ids.")
-            while True:
-                txs = random.getrandbits(TxScopeID.bit_length)
-                if txs not in self.reader.mapper.active_txscopes:
-                    break
+            txs = self.make_txs()
         TxScopeID.validate(txs)
         self.txs = txs
 
-    @staticmethod
-    def sort_units_by_mod_group_size(assoc_unit_groups):
-        for subj, *mods in assoc_unit_groups:
-            if not (u.grammar == 'SUBJECT' and \
-                    all(m.grammar == 'MODIFIER' for m in mods)):
-                raise TypeError()
+        def iowrap(s): return ARFIOWrapper(s, indexer.mapper.ut_listing)
+        storage = selfdelimitedblob.MemoryOnlyStorage(f"tx{txs}", iowrap)
+        mapper = ARFMapper(indexer.mapper.ut_listing, storage)
+        for unit in new_units:
+            storage.append(unit)
+        self.tx = Content(Query(mapper))
 
-        r = []
-        while assoc_unit_groups:
-            mod_counts = collections.Counter()
-            for subj, *mods in assoc_unit_groups:
-                mod_counts.update(mods)
-            most_common = mod_counts.most_common(1)[0][0]
+        self.occlusions = DenseIntegerSet(indexer.committed.calc_occlusions(self.tx))
 
-            defered = []
-            for units in assoc_unit_groups:
-                l = r if (most_common in units) else defered
-                l.append(most_common)
-            assoc_unit_groups = defered
-        return r
+    def make_txs(self):
+        txscopes = self.indexer.open_transactions.active_scopes
+        try:
+            TxScopeID.validate((len(txscopes) + len(self._made_txses)) << 1)
+        except TypeError:
+            raise RuntimeError("Out of assignable transaction scope ids.")
+        while True:
+            txs = random.getrandbits(TxScopeID.bit_length)
+            if txs not in txscopes and txs not in self._made_txses:
+                self._made_txses.add(txs)
+                return txs
 
-    def subjects_to_refresh(self):
-        # - subjects
-        # - "REFRESHING" type
-        # - committed
-        # - not occluded
-        # - exists (not expired), obviously
-        pass
+    def all_committed(self):
+        return self.indexer.committed.iter_stream_order()
+
+    def unoccluded_committed(self):
+        return filter(lambda x: x not in self.occlusions, self.all_committed())
 
 
 
