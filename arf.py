@@ -225,6 +225,15 @@ class Unit(UnitBase):
     additional_data_defs = {'typeid':UnitTypeID}
     cached = None
 
+class TXUnit(Unit):
+    pass
+
+class TXSubject(TXUnit):
+    grammar = 'SUBJECT'
+
+class TXModifier(TXUnit):
+    grammar = 'MODIFIER'
+
 
 
 # ARF
@@ -233,13 +242,10 @@ class ARFSpec():
     def __init__(self, inherit=None):
         if inherit is None:
             self._listing = {}
-            self.txs_mods = []
-            self.glob_mods = []
+            self.txmods = []
         else:
             self._listing = inherit._listing.copy()
-            self.txs_mods = inherit.txs_mods.copy()
-            self.glob_mods = inherit.glob_mods.copy()
-        self._all_mods = []
+            self.txmods = inherit.txmods.copy()
 
     def __getitem__(self, key):
         return self._listing[key]
@@ -264,22 +270,6 @@ class ARFSpec():
     def unit_types(self):
         return self._listing.values()
 
-    @property
-    def all_mods(self):
-        if len(self._all_mods) != (len(self.txs_mods) + len(self.glob_mods)):
-            self._all_mods = self.txs_mods + self.glob_mods
-        return self._all_mods
-
-    def applicable_mod_types_for(self, subject_ut):
-        if not subject_ut in self.unit_types():
-            raise LookupError()
-        if subject_ut.grammar != 'SUBJECT':
-            return [] # only SUBJECTs can have mods applied
-        if subject_ut.scope == 'TX':
-            return self.all_mods
-        assert subject_ut.scope == 'GLOBAL'
-        return self.glob_mods
-
     def register(self, id):
         UnitTypeID.validate(id)
         if id in self._listing:
@@ -293,11 +283,8 @@ class ARFSpec():
                                 f"{ok_range.start}..{ok_range.stop-1}")
             self._listing[id] = ut
 
-            if ut.grammar == 'MODIFIER':
-                if ut.scope == 'TX':
-                    self.txs_mods.append(ut)
-                elif ut.scope == 'GLOBAL':
-                    self.glob_mods.append(ut)
+            if issubclass(ut, TXModifier):
+                self.txmods.append(ut)
 
             return ut
         return d
@@ -316,38 +303,26 @@ base_spec = ARFSpec()
 @base_spec.register(2)
 class TxScopeMarker(Unit):
     additional_data_defs = {'prev-txs': TxScopeID, 'next-txs': TxScopeID}
-    grammar = 'SCOPE-CONTROLLER'
-    scope = 'GLOBAL'
-    persistence = 'ELAPSING'
 
 @base_spec.register(3)
-class TxScopeFinalize(Unit):
+class TxScopeFinalize(TXModifier):
     additional_data_defs = {'is-commit': Bool}
     cached = 'is-commit'
-    grammar = 'MODIFIER'
-    scope = 'TX'
-    persistence = 'ELAPSING'
 
 @base_spec.register(4)
-class StrandSelect(Unit):
+class StrandSelect(TXModifier):
     additional_data_defs = {'strd-id': StrandID}
     cached = 'strd-id'
-    grammar = 'MODIFIER'
-    scope = 'TX'
-    persistence = 'REFRESHING'
 
     # def to_range(self):
     #     id = self['strd-id']
     #     return range(id, id+1)
 
 @base_spec.register(5)
-class StrandGroupSelect(Unit):
+class StrandGroupSelect(TXModifier):
     additional_data_defs = {'strd-group': StrandID,
                             'strd-group-mag': StrandGroupMagnitude}
     cached = ('strd-group','strd-group-mag')
-    grammar = 'MODIFIER'
-    scope = 'TX'
-    persistence = 'REFRESHING'
 
     def to_range(self):
         id = self['strd-group']
@@ -373,29 +348,19 @@ class StrandCompositeSelection:
         return any(strand_id in c for c in reversed(self.containers))
 
 @base_spec.register(6)
-class StrandWriteDataBlock(Unit):
+class StrandWriteDataBlock(TXSubject):
     additional_data_defs = {'offset': StrandSize, 'data': StrandData}
     cached = 'offset'
-    grammar = 'SUBJECT'
-    scope = 'TX'
-    persistence = 'REFRESHING'
     strand_selector = StrandSelect
 
 @base_spec.register(7)
-class StrandCreate(Unit):
+class StrandCreate(TXSubject):
     additional_data_defs = {'strd-size-bytes': StrandSize}
     cached = 'strd-size-bytes'
-    grammar = 'SUBJECT'
-    scope = 'TX'
-    persistence = 'REFRESHING'
     strand_selector = StrandSelect
 
 @base_spec.register(8)
-class StrandDiscard(Unit):
-    additional_data_defs = {}
-    grammar ='SUBJECT'
-    scope ='TX'
-    persistence = 'ELAPSING'
+class StrandDiscard(TXSubject):
     strand_selector = StrandGroupSelect
 
 @base_spec.register(16)
@@ -541,11 +506,11 @@ class ARFMapper(Queryable):
             "cached_pcs" : Internal cached unit piece(s). Do not use.
             "mod_assoc" : Internal modifier associativity data. Do not use.
             "type" :    The unit's class.
-            <Applicable mod class> : For a unit with the 'SUBJECT' grammar role, this
-                        returns the modifier id (assigned by the mapper) for the
-                        modifier of the applicable type. This can also return valid ids
-                        for future modifiers that don't exist yet.
-            "mod_id" :  If the unit is a modifier, return its modifier id.
+            <Applicable mod class> : For a TXSubject, this returns the modifier id
+                        (assigned by the mapper) for the modifier of the applicable
+                        type. This can also return valid ids for future modifiers that
+                        don't exist yet.
+            "mod_id" :  If the unit is a TXModifier, return its modifier id.
             <Piece index or name> : The unit piece's value. Reads from storage if the
                         value is not cached.
             None :      Return the Unit itself, reading from storage if necessary.
@@ -581,10 +546,10 @@ class ARFMapper(Queryable):
 
             if k == 'type':
                 return ut
-            if issubclass(k, Unit) and \
-                    k in self.mapper.ut_listing.applicable_mod_types_for(ut):
-                return self.mod_assoc[self.mapper.ut_listing.all_mods.index(k)]
-            if ut.grammar == 'MODIFIER' and k == 'mod_id':
+            if issubclass(k, TXModifier) and issubclass(ut, TXSubject) and \
+                k in self.mapper.ut_listing.txmods:
+                return self.mod_assoc[self.mapper.ut_listing.txmods.index(k)]
+            if k == 'mod_id' and issubclass(ut, TXModifier):
                 return self.mod_assoc
 
             try:
@@ -601,13 +566,12 @@ class ARFMapper(Queryable):
 
             raise LookupError(f"No results for key {k}>")
 
-        def __init__(self, store_id, unit_type, cur_txscope, glob_mod_ids,
-                     txs_mod_ids):
+        def __init__(self, store_id, unit_type, cur_txscope, txmod_ids):
             ut = unit_type
             ut_listing = self.mapper.ut_listing
 
             self.store_id = store_id
-            self.txs = cur_txscope if (ut.scope == 'TX') else None
+            self.txs = cur_txscope if issubclass(ut, TXUnit) else None
             self.typeid = ut_listing.reverse_lookup(ut)
 
             # load/set cached unit pieces
@@ -620,16 +584,10 @@ class ARFMapper(Queryable):
                 self.cached_pcs = data if multi else data[0]
 
             # set modifier associativity
-            if ut.grammar == 'MODIFIER':
-                ids_for_scope, mod_types_for_scope = {
-                    'GLOBAL': (glob_mod_ids, ut_listing.glob_mods),
-                    'TX': (txs_mod_ids, ut_listing.txs_mods)
-                }[ut.scope]
-                self.mod_assoc = ids_for_scope[mod_types_for_scope.index(ut)]
-            elif ut.grammar == 'SUBJECT':
-                self.mod_assoc = list(glob_mod_ids) #copy
-                if ut.scope == 'TX':
-                    self.mod_assoc += txs_mod_ids
+            if issubclass(ut, TXModifier):
+                self.mod_assoc = txmod_ids[ut_listing.txmods.index(ut)]
+            elif issubclass(ut, TXSubject):
+                self.mod_assoc = list(txsmod_ids) #copy
             else:
                 self.mod_assoc = None
 
@@ -701,8 +659,7 @@ class ARFMapper(Queryable):
 
         self.cur_txscope = None
         self.mod_next_ids_per_txs = collections.defaultdict(
-            lambda: [0] * len(unit_type_listing.txs_mods))
-        self.mod_next_ids_per_txs[None] = [0] * len(unit_type_listing.glob_mods)
+            lambda: [0] * len(unit_type_listing.txmods))
 
         self._sync_gen = _sync_gen_func()
 
@@ -710,25 +667,24 @@ class ARFMapper(Queryable):
         return store_id in self.storage
 
     def _map_unit(self, store_id, ut):
-        assert ut.scope == 'GLOBAL' or self.cur_txscope is not None
-        ui = self.UnitInfo(store_id, ut, self.cur_txscope,
-                           self.mod_next_ids_per_txs[None],
-                           self.mod_next_ids_per_txs[self.cur_txscope])
+        assert not (issubclass(ut, TXUnit) and self.cur_txscope is None)
+        mod_nexts:list = self.mod_next_ids_per_txs[self.cur_txscope] if \
+                            (self.cur_txscope is not None) else None
+        ui = self.UnitInfo(store_id, ut, self.cur_txscope, mod_nexts)
         self.units[store_id] = ui
 
-        mod_nexts:list = self.mod_next_ids_per_txs[ui['txs']]
         if ut is TxScopeMarker:
             prev_txs, next_txs = self.storage.read(
                 store_id, select=['prev-txs','next-txs'])
             assert prev_txs == self.cur_txscope
             self.cur_txscope = next_txs
-        elif ut is TxScopeFinalize:
-            for mod_i in range(len(mod_nexts)):
+        elif issubclass(ut, TXModifier):
+            if ut is TxScopeFinalize:
+                for mod_i in range(len(mod_nexts)):
+                    mod_nexts[mod_i] += 1
+            else:
+                mod_i = self.ut_listing.txmods.index(ut)
                 mod_nexts[mod_i] += 1
-        elif ut.grammar == 'MODIFIER':
-            mod_i = self.ut_listing.txs_mods.index(ut) if ut.scope == 'TX' \
-                    else self.ut_listing.glob_mods.index(ut)
-            mod_nexts[mod_i] += 1
 
     def _sync_gen_func(self):
         read_it = lambda st: self.storage.multi_read_iter(st, select=['typeid'])
@@ -738,7 +694,7 @@ class ARFMapper(Queryable):
         while cont_glob:
             for store_id, (typeid,) in read_it(self.units.last_sync_id + 1):
                 ut = self.ut_listing[typeid]
-                if ut.scope != 'GLOBAL' or ut.grammar == 'SCOPE-CONTROLLER':
+                if issubclass(ut, TXUnit):
                     cont_glob = False
                     break
                 self._map_unit(store_id, ut)
@@ -1017,12 +973,12 @@ class SubjectWithContext:
 
         if subj.mapper != mods.queryable.mapper:
             raise TypeError()
-        if ut.grammar != 'SUBJECT':
+        if not issubclass(ut, TXSubject):
             raise TypeError()
 
         self.mods = {}
         for m in mods:
-            if m["type"].grammar != 'MODIFIER':
+            if not issubclass(m["type"], TXModifier):
                 if strict:
                     raise TypeError("Not all units in `mods` are modifiers.")
                 else:
@@ -1035,12 +991,15 @@ class SubjectWithContext:
                     continue
             self.mods[m["type"]] = m
 
-        if ut.scope == 'TX':
+        # An exception will be raised if content order is compared between a
+        # subject with a finalize mod and one without. This is deliberate.
+        # They should not be compared.
+        if TXScopeFinalize in self.mods:
             finalize = self.mods[TxScopeFinalize]
             if not finalize["is-commit"]:
                 raise ValueError("Subject can't have context because it is discarded")
-            self.content_order = finalize["store_id"]
-        elif ut.scope == 'GLOBAL':
+            self.content_order = (finalize["store_id"], subj["store_id"])
+        else:
             self.content_order = subj["store_id"]
 
         if getattr(ut,"strand_selector",None) == StrandSelect:
@@ -1145,16 +1104,16 @@ class Content:
         self.indexes = {'SUBJECT': self.subjects, 'MODIFIER': self.modifiers}
 
     def _add_unit(self, unit_info):
+        ut = unit_info["type"]
         try:
-            index = self.indexes[unit_info["type"].grammar]
-        except KeyError:
-            raise TypeError("Tried to add a non-content type")
+            assert issubclass(ut, TXUnit)
+            index = self.indexes[ut.grammar]
+        except AssertionError, KeyError as e:
+            raise TypeError("Only transaction units are allowed as content", e)
         index.maybe_add_unit(ui)
 
     def _context_for(self, subj:ARFMapper.UnitInfo):
-        is_tx = subj["type"].scope == 'TX'
-        mod_types = self.mapper.ut_listing.all_mods if is_tx else \
-                    self.mapper.ut_listing.glob_mods
+        mod_types = self.mapper.ut_listing.txmods
         mod_index_ks = frozenset((subj[txs], mt, subj[mt]) for mt in mod_types)
         q = Query(self.modifiers, {("txs","type","mod_id"):mod_index_ks})
         return SubjectWithContext(subj, q)
@@ -1236,14 +1195,10 @@ class OpenTXsIndex(ARFMapperIndex):
         self.active_scopes = collections.defaultdict(StrandCompositeSelection)
  
     def maybe_add_unit(self, unit_info):
-        if not (unit_info["type"].scope == "TX" and
-                unit_info["type"].grammar in ('SUBJECT','MODIFIER')):
+        if not issubclass(unit_info["type"], TXUnit):
             return
 
         self._add_unit(unit_info)
-
-        if ut.scope != 'TX':
-            return
 
         txs = unit_info["txs"]
         strand_selections = self.active_scopes[txs]
@@ -1264,7 +1219,8 @@ class ARFIndexer:
     def __init__(self, unit_type_listing, storage):
         self.mapper = mapper = ARFMapper(unit_type_listing, storage)
 
-        self.globals = Content(mapper=mapper)
+        self.globals = ARFMapperIndex([ARFMapperIndex.KeyDef("type")], mapper,
+                        lambda ui: not issubclass(ui["type"], TXUnit))
         self.committed = Content(mapper=mapper)
         self.open_transactions = OpenTXsIndex(mapper, self.committed.merge_in)
 
@@ -1276,13 +1232,7 @@ class ARFIndexer:
             self._add_unit(ui)
 
     def _add_unit(self, ui:ARFMapper.UnitInfo):
-        ut = ui["type"]
-        if ut.scope == 'GLOBAL' and ut.grammar in ('SUBJECT','MODIFIER')):
-            content = Content((ui,))
-            self.globals.merge_in(content)
-            if ut.grammar == 'MODIFIER':
-                self.committed.merge_in(content)
-
+        self.globals.maybe_add_unit(ui)
         self.open_transactions.maybe_add_unit(ui)
 
 
@@ -1300,6 +1250,7 @@ class TransactionComposer:
         def iowrap(s): return ARFIOWrapper(s, indexer.mapper.ut_listing)
         storage = selfdelimitedblob.MemoryOnlyStorage(f"tx{txs}", iowrap)
         mapper = ARFMapper(indexer.mapper.ut_listing, storage)
+        storage.append(indexer.mapper.ut_listing.new(TXScopeMarker, 0, 0))
         for unit in new_units:
             storage.append(unit)
         self.tx = Content(Query(mapper))
