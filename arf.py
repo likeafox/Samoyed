@@ -175,6 +175,16 @@ class unit_metaclass(type):
             ds.extend(add_dds.values())
             pns.update((name,i) for i,name in enumerate(add_dds, base_len))
 
+        # calc static byte length
+        sz = 0
+        for dt in ds:
+            if type(dt.byte_length()) is int:
+                sz += dt.byte_length()
+            else:
+                break
+        else:
+            attrs['static_data_size'] = sz
+
         attrs['data_spec'] = ds
         attrs['piece_names'] = pns
         new_cls = super(unit_metaclass, cls).__new__(cls, name, bases, attrs)
@@ -379,6 +389,8 @@ class ARFIOWrapper(selfdelimitedblob.IO):
 
     # read/load interface
 
+    SELECT_SIZE = object()
+
     def _get_next_piece_length(self, datatype):
         len_spec = datatype.byte_length()
         if type(len_spec) is int and len_spec >= 0:
@@ -404,6 +416,7 @@ class ARFIOWrapper(selfdelimitedblob.IO):
         function will perform only the minimal reads necessary to seek to the
         end of the unit in stream (at minimum, the unit type id will be read).
         """
+        start_pos = self.stream.tell()
         unit_pcs = [self._read_data(dt) for dt in Unit.data_spec]
         unit_typeid = unit_pcs[Unit.key_to_piece_index('typeid')]
 
@@ -415,27 +428,38 @@ class ARFIOWrapper(selfdelimitedblob.IO):
 
         unit_type = self.spec[unit_typeid]
         if select is None:
-            choice_indices = range(len(unit_type.data_spec))
+            indices_to_read = range(len(unit_type.data_spec))
         else:
-            choice_indices = [unit_type.key_to_piece_index(k) for k in select]
-            assert len(choice_indices) == len(set(choice_indices))
+            indices_to_read = set(unit_type.key_to_piece_index(k) for k in select \
+                               if k is not self.SELECT_SIZE)
 
         for i,dt in islice(enumerate(unit_type.data_spec), start=len(unit_pcs)):
-            if i in choice_indices:
+            if i in indices_to_read:
                 p = self._read_data(dt)
             else:
                 self.stream.seek(self._get_next_piece_length(dt),1)
                 p = None
             unit_pcs.append(p)
 
+        sz = self.stream.tell() - start_pos
+
         if select is None:
             return unit_type(*unit_pcs) # unit instance by default
-        return [unit_pcs[i] for i in select] # optionally, pick specific pieces
+
+        # optionally, pick specific pieces
+        def pick():
+            for k in select:
+                if k is self.SELECT_SIZE:
+                    yield sz
+                else:
+                    i = unit_type.key_to_piece_index(k)
+                    yield unit_pcs[i]
+        return list(pick())
 
     # skip interface
 
     def skip_next(self):
-        return None if (self._read_next([]) is None) else True
+        return None if (self.read_next([]) is None) else True
 
     # write interface
 
@@ -493,6 +517,8 @@ class ARFMapper(Queryable):
         __slots__ = ('store_id','txs','typeid','cached_pcs','mod_assoc')
         READ_REQUIRED = object()
 
+        _read_translation_map = {"store_sz": ARFIOWrapper.SELECT_SIZE}
+
         def __getitem__(self, k):
             """Get cached unit data, with a fall-back to a read operation on the stored
             unit.
@@ -500,6 +526,7 @@ class ARFMapper(Queryable):
             The various forms of `k`, and what the function returns for each:
 
             "store_id" : The id of the unit, assigned by the storage.
+            "store_sz" : The storage size, in bytes.
             "txs" :     Id of the transaction scope the unit is in (or None if the unit
                         is in the global scope).
             "typeid" :  Id of the unit's unit type.
@@ -526,8 +553,9 @@ class ARFMapper(Queryable):
             ks = k if multi else (k,)
 
             cache_results = [self._get_single_no_read(k) for k in ks]
-            read_select = [k for k,r in zip(ks, cache_results)
-                            if r is self.READ_REQUIRED]
+            read_select = [self._read_translation_map.get(k,k)
+                           for k,r in zip(ks, cache_results)
+                           if r is self.READ_REQUIRED]
             if read_select:
                 read_results = iter(self.mapper.storage.read(self.store_id,
                                                         select=read_select))
@@ -551,6 +579,8 @@ class ARFMapper(Queryable):
                 return self.mod_assoc[self.mapper.ut_listing.txmods.index(k)]
             if k == 'mod_id' and issubclass(ut, TXModifier):
                 return self.mod_assoc
+            if k == "store_sz":
+                return getattr(ut, "static_data_sz", self.READ_REQUIRED)
 
             try:
                 i = ut.key_to_piece_index(k)
