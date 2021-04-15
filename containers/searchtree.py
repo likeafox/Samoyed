@@ -127,11 +127,13 @@ class KeyspaceSlice:
         if type(slice_) is not slice:
             raise TypeError("This function is for sub-slicing only.")
         if slice_.step is not None:
-            raise TypeError("As integral (int) SearchTree keys are not "\
-                            "enforced, slice steps cannot be supported.")
-        start = slice_.start if (slice_.start in self) else self.start
-        stop = slice_.stop if (slice_.stop in self) else self.stop
-        return self.__class__(start, stop, self.direction)
+            raise NotImplementedError("As integral (int) SearchTree keys are "\
+                    "not enforced, slice steps cannot be supported.")
+        new_start = (slice_.start is not None) and (slice_.start in self)
+        new_stop = (slice_.stop is not None) and (slice_.stop in self)
+        return self.__class__(slice_.start if new_start else self.start,
+                              slice_.stop if new_stop else self.stop,
+                              self.direction)
 
 KeyspaceSlice.default = KeyspaceSlice(None, None, directions.right)
 
@@ -184,6 +186,8 @@ class SearchTree:
         path = find_existing.path_nodes
 
         if find_existing: # then k is already in tree; replace its node
+            if self.last_found.k == k:
+                self._clear_last_found()
             parent = path[-2]
             course = parent.children.index(find_existing.node)
             parent.children[course] = new_node
@@ -275,6 +279,9 @@ class SearchTree:
     def __iter__(self):
         return self._keys_iter()
 
+    def __reversed__(self):
+        return self._keys_iter(KeyspaceSlice(None, None, directions.left))
+
 
 
 class MapNode(Node):
@@ -288,8 +295,7 @@ class MapNode(Node):
 class SearchTreeMap(SearchTree, collections.abc.MutableMapping):
     def __getitem__(self, k):
         if type(k) is slice:
-            ksslice = KeyspaceSlice(k.start, k.stop, self.default_iter_direction)[k]
-            return self._getsliceview(ksslice)
+            return self._getsliceview(KeyspaceSlice.default[k])
         node = self._try_find_node(k).node
         if node is None:
             raise KeyError()
@@ -319,6 +325,8 @@ class SearchTreeMapSliceView(collections.abc.Mapping):
     def __init__(self, tree:SearchTreeMap, ksslice:KeyspaceSlice):
         self.tree = tree
         self.ksslice = ksslice
+        self.cached_size = None
+        self.cached_size_version = -1
 
     def __contains__(self, k):
         return k in self.ksslice and k in self.tree
@@ -335,7 +343,10 @@ class SearchTreeMapSliceView(collections.abc.Mapping):
 
     def __len__(self):
         # what a horrible function
-        return sum(1 for _ in iter(self))
+        if self.cached_size_version != self.tree.version:
+            self.cached_size_version = self.tree.version
+            self.cached_size = sum(1 for _ in iter(self))
+        return self.cached_size
 
     def __bool__(self):
         for _ in self(iter):

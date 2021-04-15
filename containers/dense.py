@@ -7,6 +7,7 @@ def count_bits(x:int):
 
 class DenseIntegerSet(collections.abc.MutableSet):
     bit_masks = bytes(0x80 >> i for i in range(8))
+    enumerated_bit_masks = list(enumerate(bit_masks))
 
     def __init__(self, iterable=None, segment_bytelen=512):
         if count_bits(segment_bytelen) != 1:
@@ -44,15 +45,32 @@ class DenseIntegerSet(collections.abc.MutableSet):
             seg = self.segments[seg_i]
         except KeyError:
             return False
-        return bool(seg[byte_i] & self.byte_mask[bit_i])
+        return bool(seg[byte_i] & self.bit_masks[bit_i])
+
+    def _get_iter(self, sort=0):
+        iterate, segments_keys = {
+            0:  ( iter,     self.segments.keys                     ),
+            1:  ( iter,     (lambda: sorted(self.segments.keys())) ),
+            -1: ( reversed, (lambda: sorted(self.segments.keys())) )
+        }[sort]
+
+        for seg_i in segments_keys():
+            seg = memoryview(self.segments[seg_i])[:self.segment_bytelen]
+            byte_it = zip(iterate(range(self.segment_bytelen)), iterate(seg))
+            for byte_i, byte_ in byte_it:
+                if byte_:
+                    for bit_i, mask in iterate(self.enumerated_bit_masks):
+                        if byte_ & mask:
+                            yield self._join_key(seg_i, byte_i, bit_i)
 
     def __iter__(self):
-        for seg_i, seg in self.segments.items():
-            for byte_i, byte_ in zip(range(self.segment_bytelen), seg):
-                if byte_:
-                    for bit_i, mask in enumerate(self.byte_masks):
-                        if byte_ & mask:
-                            return self._join_key(seg_i, byte_i, bit_i)
+        return self._get_iter()
+
+    def sorted(self):
+        return self._get_iter(1)
+
+    def reverse_sorted(self):
+        return self._get_iter(-1)
 
     def _counter_arithmetic(self, seg, v):
         view = memoryview(seg)[self.segment_bytelen:]
